@@ -96,6 +96,24 @@ def drive_copy_to_folder(drive: GoogleDrive, src_parent_id: str, filename: str, 
     return copied['id']
 
 # ---------- SIMPLE LOGIN ----------
+# def require_login():
+#     if "auth_user" not in st.session_state:
+#         st.session_state.auth_user = None
+
+#     if st.session_state.auth_user:
+#         return True
+
+#     st.title("Image Filtering Login")
+#     user = st.text_input("Name", placeholder="e.g., Gagan")
+#     pwd  = st.text_input("Password", type="password", placeholder="Provided password")
+#     if st.button("Sign in"):
+#         users = st.secrets.get("users", {})
+#         if user in users and str(users[user]) == str(pwd):
+#             st.session_state.auth_user = user
+#             st.experimental_rerun()
+#         else:
+#             st.error("Invalid credentials.")
+#     st.stop()
 def require_login():
     if "auth_user" not in st.session_state:
         st.session_state.auth_user = None
@@ -104,17 +122,19 @@ def require_login():
         return True
 
     st.title("Image Filtering Login")
-    user = st.text_input("Name", placeholder="e.g., Gagan")
-    pwd  = st.text_input("Password", type="password", placeholder="Provided password")
+    user_in = st.text_input("Name", placeholder="e.g., Gagan")
+    pwd_in  = st.text_input("Password", type="password", placeholder="Provided password")
+
     if st.button("Sign in"):
-        users = st.secrets.get("users", {})
-        if user in users and str(users[user]) == str(pwd):
-            st.session_state.auth_user = user
+        users_map = st.secrets.get("users", {})
+        # normalize: case-insensitive username, strip spaces
+        norm = {k.strip().casefold(): str(v) for k, v in users_map.items()}
+        if user_in.strip().casefold() in norm and str(pwd_in) == norm[user_in.strip().casefold()]:
+            st.session_state.auth_user = user_in.strip()
             st.experimental_rerun()
         else:
             st.error("Invalid credentials.")
     st.stop()
-
 # ---------- APP ----------
 def main():
     require_login()
