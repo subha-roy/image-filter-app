@@ -317,5 +317,59 @@ def main():
 def existing_endswith_newline(s: str) -> bool:
     return len(s) > 0 and s[-1] == "\n"
 
+import streamlit as st
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+st.set_page_config(page_title="Image Filtering", layout="wide")
+st.set_option('client.showErrorDetails', True)
+
+@st.cache_resource(show_spinner=False)
+def get_drive_client(creds_dict):
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+@st.cache_data(show_spinner=False)
+def list_folder_files(drive, folder_id):
+    # lightweight listing; defer image fetch until needed
+    q = f"'{folder_id}' in parents and trashed = false"
+    files = drive.files().list(q=q, fields="files(id,name,mimeType,size)").execute().get("files", [])
+    return {f["name"]: f["id"] for f in files}
+
+def main():
+    st.title("Image Filtering")
+
+    # --- LOGIN ---
+    users = st.secrets["users"]
+    with st.sidebar:
+        st.header("Login")
+        username = st.text_input("Name")
+        password = st.text_input("Password", type="password")
+    if not username or users.get(username) != password:
+        st.info("Enter valid credentials to continue.")
+        st.stop()
+
+    # --- Drive init is lazy; only if we have secrets ---
+    gcp = st.secrets["gcp_service_account"]
+    drive = get_drive_client(gcp)
+
+    # --- Small health check (does not scan everything) ---
+    with st.sidebar:
+        st.header("Data source")
+        folder_id = st.text_input("Google Drive folder ID (root that contains dataset/images/*)")
+        if st.button("Test connection"):
+            try:
+                _ = list_folder_files(drive, folder_id)
+                st.success("Drive reachable ✅")
+            except Exception as e:
+                st.error(f"Drive error: {e}")
+                st.stop()
+
+    # Defer the rest of your UI… (load category → then list one JSONL → then load 1 pair)
+    # ...
+
 if __name__ == "__main__":
     main()
