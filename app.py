@@ -10,16 +10,19 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 # ─────────────────────────── App config ───────────────────────────
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
+# ---- ALWAYS initialize session_state EARLY to avoid KeyError ----
+if "page" not in st.session_state:
+    st.session_state.page = "home"
+if "cat" not in st.session_state:
+    st.session_state.cat = None
+if "idx" not in st.session_state:
+    st.session_state.idx = 0  # current record index
+
 # ========== 1) Google Drive helpers (robust SA parsing) ==========
 @st.cache_resource
 def get_drive():
-    """
-    Return Drive service using service-account JSON from secrets.
-    Tolerates both plain JSON and TOML-pasted strings with real newlines.
-    """
     sa_raw = st.secrets["gcp"]["service_account"]
     if isinstance(sa_raw, str):
-        # If private_key contains literal newlines, re-escape them
         if '"private_key"' in sa_raw and "\n" in sa_raw and "\\n" not in sa_raw:
             sa_raw = sa_raw.replace("\r\n", "\\n").replace("\n", "\\n")
         sa = json.loads(sa_raw)
@@ -65,42 +68,22 @@ def copy_file_to_folder(drive, src_file_id: str, new_name: str, dest_folder_id: 
     return drive.files().copy(fileId=src_file_id, body=body, fields="id,name").execute()["id"]
 
 def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
-    # Validate the ID first
     try:
         meta = drive.files().get(fileId=file_id, fields="id,name,mimeType,trashed").execute()
     except HttpError as e:
         st.error(
-            "Could not access JSONL file.\n\n"
-            "- Check the **file ID** (must be a file, not a folder).\n"
-            "- Share the file with the **service account** (Viewer or Editor).\n\n"
+            "Could not access JSONL file. Check the file ID and sharing to the service account.\n\n"
             f"Drive API error: {e}"
         )
         st.stop()
-
     if meta.get("trashed"):
-        st.error(f"The JSONL file `{meta.get('name')}` is in Trash. Restore it first.")
+        st.error(f"The JSONL file `{meta.get('name')}` is in Trash.")
         st.stop()
-
     if meta.get("mimeType") == "application/vnd.google-apps.folder":
-        st.error(
-            f"The provided ID is a **folder**, not a file: `{meta.get('name')}`.\n"
-            "Please paste the **file** ID of your JSONL into secrets."
-        )
+        st.error("The provided ID is a FOLDER, not a FILE. Use the JSONL file ID.")
         st.stop()
 
-    # Download the bytes
-    try:
-        raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
-    except HttpError as e:
-        st.error(
-            "Failed to download JSONL from Drive.\n\n"
-            "Common causes:\n"
-            "- The service account does **not** have permission on the file.\n"
-            "- The file is a Google Doc/Sheet (needs export), not a plain file.\n\n"
-            f"Drive API error: {e}"
-        )
-        st.stop()
-
+    raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
     out = []
     for line in raw.splitlines():
         line = line.strip()
@@ -123,7 +106,6 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str]):
     drive_upload_bytes(drive, parent_id="", name="", data=updated.encode("utf-8"), file_id=file_id)
 
 # ========== 2) Category configuration from secrets ==========
-# Expect these keys inside [gcp] in secrets.toml
 CAT_CFG = {
     "demography": {
         "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
@@ -165,15 +147,11 @@ drive = get_drive()
 # ───────── helpers bound to category ─────────
 @st.cache_data(show_spinner=False)
 def load_meta(jsonl_id: str):
-    # Load ALL lines once for the active category
     return read_jsonl_from_drive(drive, jsonl_id, max_lines=None)
 
 @st.cache_data(show_spinner=False)
 def load_decisions_map(file_id: str):
-    """
-    Return a dict keyed by image filename, holding the last decision record.
-    Each line in the log is one JSON object { ... , "status": "accepted"/"rejected", "side": "hypo"/"adv", ... }
-    """
+    """Map image filename → last decision record."""
     try:
         txt = read_text_from_drive(drive, file_id)
     except Exception:
@@ -191,40 +169,28 @@ def load_decisions_map(file_id: str):
             continue
     return decided
 
-def first_undecided_index(meta, d_h, d_a):
-    """
-    Find first index where either hypo or adv image has no decision yet.
-    """
+def first_undecided_index(meta, dec_h, dec_a):
     for i, m in enumerate(meta):
-        h_name = m.get("hypo_id")
-        a_name = m.get("adversarial_id")
-        if (h_name and h_name not in d_h) or (a_name and a_name not in d_a):
+        h = m.get("hypo_id")
+        a = m.get("adversarial_id")
+        if (h and h not in dec_h) or (a and a not in dec_a):
             return i
     return 0
-
-# ========== 3) Simple router: home → dashboard → review ==========
-if "page" not in st.session_state:
-    st.session_state.page = "home"
-if "cat" not in st.session_state:
-    st.session_state.cat = None
-if "idx" not in st.session_state:
-    st.session_state.idx = 0  # current record index within selected category
 
 def go(page): st.session_state.page = page
 
 # ─────────────────────────── HOME ───────────────────────────
 if st.session_state.page == "home":
     st.markdown("## Image Triplet Filter")
-
-    cat = st.selectbox("Select category", list(CAT_CFG.keys()))
-    if st.button("Continue ➜", type="primary"):
+    cat = st.selectbox("Select category", list(CAT_CFG.keys()), key="home_cat")
+    if st.button("Continue ➜", type="primary", key="btn_continue"):
         st.session_state.cat = cat
         st.session_state.idx = 0
         go("dashboard")
 
 # ──────────────────────── DASHBOARD ─────────────────────────
 elif st.session_state.page == "dashboard":
-    st.button("⬅️ Back", on_click=lambda: go("home"))
+    st.button("⬅️ Back", on_click=lambda: go("home"), key="btn_back_home")
     cat = st.session_state.cat
     if cat is None:
         st.warning("Pick a category first.")
@@ -250,53 +216,45 @@ elif st.session_state.page == "dashboard":
     c4.metric("Adversarial decided", adv_done)
     st.info(f"Pending to fully complete: **{pending}**")
 
-    if st.button("▶️ Start / Resume", type="primary"):
-        # jump to first undecided
+    if st.button("▶️ Start / Resume", type="primary", key=f"btn_start_{cat}"):
         st.session_state.idx = first_undecided_index(meta, dec_h, dec_a)
         go("review")
 
 # ───────────────────────── REVIEW ───────────────────────────
 elif st.session_state.page == "review":
-    top_left = st.columns([1, 8])[0]
-    top_left.button("⬅️ Back", on_click=lambda: go("dashboard"))
+    st.button("⬅️ Back", on_click=lambda: go("dashboard"), key="btn_back_dash")
 
     cat = st.session_state.cat
     cfg = CAT_CFG[cat]
 
-    # data
     meta = load_meta(cfg["jsonl_id"])
     if not meta:
         st.warning("No records.")
         st.stop()
 
-    # clamp idx
+    # clamp idx and fetch entry
     st.session_state.idx = max(0, min(st.session_state.idx, len(meta)-1))
     i = st.session_state.idx
     entry = meta[i]
 
-    # decisions (per-side)
     dec_h = load_decisions_map(cfg["log_hypo"])
     dec_a = load_decisions_map(cfg["log_adv"])
 
-    # text blocks
     st.markdown(f"### {entry.get('id','(no id)')}")
     with st.expander("📝 TEXT & Descriptions", expanded=True):
         st.markdown(f"**TEXT**: {entry.get('text','')}")
         st.markdown(f"**HYPOTHESIS (non-prototype)**: {entry.get('hypothesis','')}")
         st.markdown(f"**ADVERSARIAL (prototype)**: {entry.get('adversarial','')}")
 
-    # image names
     hypo_name = entry.get("hypo_id")
     adv_name  = entry.get("adversarial_id")
 
-    # resolve source drive file ids
     src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name) if hypo_name else None
     src_a_id = find_file_id_in_folder(drive, cfg["src_adv"],  adv_name)  if adv_name  else None
 
-    # Layout: two columns with per-image controls
     c1, c2 = st.columns(2)
 
-    # ---------- HYPOTHESIS SIDE ----------
+    # ---------- HYPOTHESIS ----------
     with c1:
         st.markdown("**Hypothesis (non-proto)**")
         if src_h_id:
@@ -304,17 +262,17 @@ elif st.session_state.page == "review":
         else:
             st.error(f"Missing image: {hypo_name}")
 
-        # Decision state & buttons
         decided_h = dec_h.get(hypo_name)
         if decided_h:
             st.success(f"Status: **{decided_h.get('status','?')}**")
-        b1, b2 = st.columns(2)
+
+        bh1, bh2 = st.columns(2)
 
         def log_h(status: str, saved_id=None):
             rec = dict(entry)
             rec.update({
                 "side": "hypo",
-                "status": status,           # accepted / rejected
+                "status": status,
                 "image_name": hypo_name,
                 "src_file_id": src_h_id,
                 "copied_file_id": saved_id,
@@ -323,20 +281,22 @@ elif st.session_state.page == "review":
             append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec, ensure_ascii=False) + "\n"])
             load_decisions_map.clear()
 
-        with b1:
-            ok = st.button("✅ Accept (copy)", use_container_width=True, disabled=(not src_h_id) or bool(decided_h))
-            if ok:
+        with bh1:
+            if st.button("✅ Accept (copy)", use_container_width=True,
+                         disabled=(not src_h_id) or bool(decided_h),
+                         key=f"btn_accept_h_{entry.get('id','noid')}"):
                 new_id = copy_file_to_folder(drive, src_h_id, hypo_name, cfg["dst_hypo"]) if src_h_id else None
                 log_h("accepted", new_id)
                 st.rerun()
 
-        with b2:
-            ok = st.button("❌ Reject (log)", use_container_width=True, disabled=bool(decided_h))
-            if ok:
+        with bh2:
+            if st.button("❌ Reject (log)", use_container_width=True,
+                         disabled=bool(decided_h),
+                         key=f"btn_reject_h_{entry.get('id','noid')}"):
                 log_h("rejected", None)
                 st.rerun()
 
-    # ---------- ADVERSARIAL SIDE ----------
+    # ---------- ADVERSARIAL ----------
     with c2:
         st.markdown("**Adversarial (proto)**")
         if src_a_id:
@@ -347,7 +307,8 @@ elif st.session_state.page == "review":
         decided_a = dec_a.get(adv_name)
         if decided_a:
             st.success(f"Status: **{decided_a.get('status','?')}**")
-        c21, c22 = st.columns(2)
+
+        ba1, ba2 = st.columns(2)
 
         def log_a(status: str, saved_id=None):
             rec = dict(entry)
@@ -362,30 +323,31 @@ elif st.session_state.page == "review":
             append_lines_to_drive_text(drive, cfg["log_adv"], [json.dumps(rec, ensure_ascii=False) + "\n"])
             load_decisions_map.clear()
 
-        with c21:
-            ok = st.button("✅ Accept (copy)", use_container_width=True, disabled=(not src_a_id) or bool(decided_a))
-            if ok:
+        with ba1:
+            if st.button("✅ Accept (copy)", use_container_width=True,
+                         disabled=(not src_a_id) or bool(decided_a),
+                         key=f"btn_accept_a_{entry.get('id','noid')}"):
                 new_id = copy_file_to_folder(drive, src_a_id, adv_name, cfg["dst_adv"]) if src_a_id else None
                 log_a("accepted", new_id)
                 st.rerun()
 
-        with c22:
-            ok = st.button("❌ Reject (log)", use_container_width=True, disabled=bool(decided_a))
-            if ok:
+        with ba2:
+            if st.button("❌ Reject (log)", use_container_width=True,
+                         disabled=bool(decided_a),
+                         key=f"btn_reject_a_{entry.get('id','noid')}"):
                 log_a("rejected", None)
                 st.rerun()
 
-    # ---------- Prev / Next navigation (bottom) ----------
+    # ---------- Prev / Next navigation ----------
     nav_left, nav_right = st.columns([1,1])
     with nav_left:
-        if st.button("⏮ Prev"):
+        if st.button("⏮ Prev", key=f"btn_prev_{entry.get('id','noid')}"):
             st.session_state.idx = max(0, i - 1)
             st.rerun()
     with nav_right:
-        if st.button("Next ⏭"):
-            # Prefer jump to next UNDONE record
+        if st.button("Next ⏭", key=f"btn_next_{entry.get('id','noid')}"):
+            # Jump to next UNDECIDED record if possible
             next_i = i + 1
-            # refresh maps for an up-to-date check
             dec_h2 = load_decisions_map(cfg["log_hypo"])
             dec_a2 = load_decisions_map(cfg["log_adv"])
             while next_i < len(meta):
