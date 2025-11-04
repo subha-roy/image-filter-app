@@ -4,6 +4,7 @@ import streamlit as st
 # Google Drive API
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # ─────────────────────────── App config ───────────────────────────
@@ -64,15 +65,51 @@ def copy_file_to_folder(drive, src_file_id: str, new_name: str, dest_folder_id: 
     return drive.files().copy(fileId=src_file_id, body=body, fields="id,name").execute()["id"]
 
 def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
-    raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+    # Validate the ID first: make sure it’s a real file, not a folder,
+    # and that we have permission.
+    try:
+        meta = drive.files().get(fileId=file_id, fields="id,name,mimeType,trashed").execute()
+    except HttpError as e:
+        st.error(
+            "Could not access JSONL file.\n\n"
+            f"- Check that the **ID** is correct (file, not folder).\n"
+            f"- Share the file with the **service account** email (Viewer or Editor).\n\n"
+            f"Drive API error: {e}"
+        )
+        st.stop()
+
+    if meta.get("trashed"):
+        st.error(f"The JSONL file `{meta.get('name')}` is in Trash. Restore it first.")
+        st.stop()
+
+    if meta.get("mimeType") == "application/vnd.google-apps.folder":
+        st.error(
+            f"The provided ID is a **folder**, not a file: `{meta.get('name')}`.\n"
+            "Please paste the **file** ID of your JSONL into secrets."
+        )
+        st.stop()
+
+    # Now download the bytes
+    try:
+        raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+    except HttpError as e:
+        st.error(
+            "Failed to download JSONL from Drive.\n\n"
+            "Common causes:\n"
+            "- The service account does **not** have permission on the file.\n"
+            "- The file is a Google Doc/Sheet (needs export), not a plain file.\n\n"
+            f"Drive API error: {e}"
+        )
+        st.stop()
+
     out = []
     for line in raw.splitlines():
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
         try:
             out.append(json.loads(line))
         except Exception:
-            # ignore malformed
             continue
         if max_lines and len(out) >= max_lines:
             break
