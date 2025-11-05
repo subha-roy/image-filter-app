@@ -12,7 +12,6 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
 # =========================== Drive helpers ===========================
-
 @st.cache_resource
 def get_drive():
     sa_raw = st.secrets["gcp"]["service_account"]
@@ -95,6 +94,24 @@ def read_jsonl_from_drive(drive, file_id: str):
         except Exception:
             pass
     return out
+    
+# Cache raw bytes (per file id) so Drive isn’t hit every rerun
+@st.cache_data(show_spinner=False)
+def get_drive_bytes_cached(file_id: str) -> bytes:
+    drv = get_drive()
+    return drive_download_bytes(drv, file_id)  # your existing function
+
+# Create and cache a small preview to save RAM/CPU
+@st.cache_data(show_spinner=False)
+def make_preview_bytes(file_id: str, max_side: int = 900) -> bytes:
+    raw = get_drive_bytes_cached(file_id)
+    # Pillow decode -> downscale -> JPEG
+    with Image.open(io.BytesIO(raw)) as im:
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side))  # in-place, preserves aspect
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
 
 # =========================== Category config ===========================
 
@@ -264,38 +281,25 @@ elif st.session_state.page == "review":
     # resolve Drive IDs
     src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name)
     src_a_id = find_file_id_in_folder(drive, cfg["src_adv"],  adv_name)
-
-    # cache & shrink images for faster rendering
-    @st.cache_data(show_spinner=False)
-    def get_img_bytes(fid: str) -> Optional[bytes]:
-        if not fid: return None
-        try:
-            return drive_download_bytes(drive, fid)
-        except HttpError:
-            return None
-
-    def show_img(fid: Optional[str], caption: str):
-        if not fid:
-            st.error(f"Missing image: {caption}")
-            return
-        b = get_img_bytes(fid)
-        if not b:
-            st.error(f"Cannot load: {caption}")
-            return
-        # resize client-side for faster layout (download size unchanged)
-        try:
-            im = Image.open(io.BytesIO(b))
-            im.thumbnail((1024, 1024))  # smaller display
-            st.image(im, caption=caption, use_column_width=True)
-        except Exception:
-            st.image(b, caption=caption, use_column_width=True)
+    
+    def show_img_preview(file_id: Optional[str], caption: str):
+    if not file_id:
+        st.error(f"Missing image: {caption}")
+        return
+    try:
+        # uses the cached + downscaled preview you defined above
+        st.image(make_preview_bytes(file_id), caption=caption, use_container_width=True)
+    except Exception as e:
+        # fallback to original bytes if Pillow fails
+        st.warning(f"Preview failed ({e}); showing original.")
+        st.image(get_drive_bytes_cached(file_id), caption=caption, use_container_width=True)
 
     c1, c2 = st.columns(2)
 
     # ---------- Hypothesis ----------
     with c1:
         st.markdown("**Hypothesis (non-proto)**")
-        show_img(src_h_id, hypo_name)
+        show_img_preview(src_h_id, hypo_name) 
         b1, b2 = st.columns(2)
         with b1:
             if st.button("✅ Accept (hypo)", key=f"acc_h_{pair_key}", use_container_width=True):
@@ -308,7 +312,7 @@ elif st.session_state.page == "review":
     # ---------- Adversarial ----------
     with c2:
         st.markdown("**Adversarial (proto)**")
-        show_img(src_a_id, adv_name)
+        show_img_preview(src_a_id, adv_name) 
         b3, b4 = st.columns(2)
         with b3:
             if st.button("✅ Accept (adv)", key=f"acc_a_{pair_key}", use_container_width=True):
