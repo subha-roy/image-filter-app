@@ -10,7 +10,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-Image.MAX_IMAGE_PIXELS = None  # tolerate large images
+# ---- General tweaks ----
+Image.MAX_IMAGE_PIXELS = None
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
 # =========================== Auth ============================
@@ -44,6 +45,7 @@ if "user" not in st.session_state:
 def get_drive():
     sa_raw = st.secrets["gcp"]["service_account"]
     if isinstance(sa_raw, str):
+        # tolerate pasted JSON with real newlines
         if '"private_key"' in sa_raw and "\n" in sa_raw and "\\n" not in sa_raw:
             sa_raw = sa_raw.replace("\r\n", "\\n").replace("\n", "\\n")
         sa = json.loads(sa_raw)
@@ -66,7 +68,7 @@ def read_text_from_drive(drive, file_id: str) -> str:
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str], retries: int = 3):
     """
-    Optimistic append with small retry to mitigate concurrent writes.
+    Optimistic append with tiny backoff (helps when 2 people save near-simultaneously).
     """
     for attempt in range(retries):
         try:
@@ -76,8 +78,8 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str], retrie
             drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
             return
         except HttpError:
-            time.sleep(0.4 * (attempt + 1))
-    # bubble up if still failing
+            time.sleep(0.35 * (attempt + 1))
+    # last try: write just the new chunk (better than losing the action)
     media = MediaIoBaseUpload(io.BytesIO("".join(new_lines).encode("utf-8")), mimetype="text/plain", resumable=False)
     drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
@@ -105,6 +107,7 @@ def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_
     ).execute()
     return res["id"]
 
+# ---- Cached previews (fast & memory-safe) ----
 @st.cache_data(show_spinner=False, max_entries=256, ttl=3600)
 def get_drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
     drv = get_drive()
@@ -117,7 +120,7 @@ def get_drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
         url = meta.get("thumbnailLink")
         if not url:
             return None
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
         if r.ok:
             return r.content
     except Exception:
@@ -129,6 +132,7 @@ def make_preview_bytes(file_id: str, max_side: int = 720) -> bytes:
     tb = get_drive_thumbnail_bytes(file_id)
     src = tb
     if src is None:
+        # fallback to original content (still cached)
         drv = get_drive()
         buf = io.BytesIO()
         req = drv.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -232,7 +236,7 @@ def _latest_by_pair_annotator(lines: list[Dict[str, Any]]) -> Dict[str, Dict[str
 
 @st.cache_data(show_spinner=False)
 def load_map(file_id: str):
-    rows = load_meta(file_id)  # re-use reader
+    rows = load_meta(file_id)  # read that JSONL (log) file
     return _latest_by_pair_annotator(rows)
 
 # ========================= UI State =========================
@@ -288,6 +292,7 @@ elif st.session_state.page == "dashboard":
     c2.metric("Completed (you)", completed)
     c3.metric("Pending (you)", pending)
 
+    # first undecided for this annotator
     def first_undecided_index():
         for i, e in enumerate(meta):
             pk = pair_key(e)
@@ -312,6 +317,16 @@ elif st.session_state.page == "review":
     if not meta:
         st.warning("No records.")
         st.stop()
+
+    # helper to jump to next undecided pair for this annotator
+    def next_undecided_from(start_idx: int) -> int:
+        for j in range(start_idx, len(meta)):
+            hypo = meta[j].get("hypo_id","")
+            adv  = meta[j].get("adversarial_id","")
+            pk   = f"{hypo}|{adv}"
+            if not (f"{pk}||{who}" in load_map(cfg["log_hypo"]) and f"{pk}||{who}" in load_map(cfg["log_adv"])):
+                return j
+        return len(meta) - 1
 
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
@@ -382,7 +397,7 @@ elif st.session_state.page == "review":
         rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": dec.get("hypo") or "rejected", "decided_at": ts})
         rec_a = dict(base); rec_a.update({"side":"adversarial", "status": dec.get("adv") or "rejected", "decided_at": ts})
 
-        # idempotence guard: same (pk, decisions, annotator) hash won’t append twice this session
+        # idempotence guard across quick re-clicks
         token = hashlib.sha1(json.dumps({"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":who}).encode()).hexdigest()
         if st.session_state.last_save_token == token:
             st.info("Already saved this exact decision.")
@@ -390,7 +405,7 @@ elif st.session_state.page == "review":
             return
 
         try:
-            # Only create shortcuts when accepted (cheap & quota-safe)
+            # Only create shortcuts when accepted (quota-safe)
             if dec.get("hypo") == "accepted" and src_h_id:
                 rec_h["copied_id"] = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
             if dec.get("adv") == "accepted" and src_a_id:
@@ -401,7 +416,6 @@ elif st.session_state.page == "review":
             return
 
         try:
-            # Append as two JSONL lines; per-annotator dedupe happens in load_map()
             append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
             append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
         except HttpError as e:
@@ -409,12 +423,13 @@ elif st.session_state.page == "review":
             st.session_state.saving = False
             return
 
-        load_map.clear()  # refresh cache next render
+        load_map.clear()  # refresh caches next draw
         st.session_state.last_save_token = token
         st.success("Saved.")
         st.session_state.saving = False
 
-    nav_l, save_c, nav_r = st.columns([1,2,1])
+    nav_l, save_c, nav_r, jump_r = st.columns([1,2,1,1])
+
     with nav_l:
         if st.button("⏮ Prev", key=f"prev_{pk}", use_container_width=True):
             st.session_state.idx = max(0, i-1)
@@ -427,4 +442,9 @@ elif st.session_state.page == "review":
     with nav_r:
         if st.button("Next ⏭", key=f"next_{pk}", use_container_width=True):
             st.session_state.idx = min(len(meta)-1, i+1)
+            st.rerun()
+
+    with jump_r:
+        if st.button("Next undecided ➡️", key=f"next_und_{pk}", use_container_width=True):
+            st.session_state.idx = next_undecided_from(i+1)
             st.rerun()
