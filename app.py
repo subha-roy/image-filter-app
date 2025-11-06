@@ -1,5 +1,6 @@
+# app.py
 import io, json, time, hashlib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import requests
 from PIL import Image
 import streamlit as st
@@ -11,7 +12,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # -------- Safe image defaults --------
-Image.MAX_IMAGE_PIXELS = 80_000_000  # keep huge images safe but not infinite
+Image.MAX_IMAGE_PIXELS = 80_000_000  # large but safe
 
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
@@ -46,6 +47,7 @@ if "user" not in st.session_state:
 def get_drive():
     sa_raw = st.secrets["gcp"]["service_account"]
     if isinstance(sa_raw, str):
+        # normalize newlines if pasted raw
         if '"private_key"' in sa_raw and "\n" in sa_raw and "\\n" not in sa_raw:
             sa_raw = sa_raw.replace("\r\n", "\\n").replace("\n", "\\n")
         sa = json.loads(sa_raw)
@@ -55,6 +57,8 @@ def get_drive():
         sa, scopes=["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=creds)
+
+drive = get_drive()
 
 def _download_bytes(drive, file_id: str) -> bytes:
     req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -69,28 +73,31 @@ def _download_bytes(drive, file_id: str) -> bytes:
 def read_text_from_drive(drive, file_id: str) -> str:
     return _download_bytes(drive, file_id).decode("utf-8", errors="ignore")
 
-def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str], retries: int = 3):
-    # optimistic append with small retry for concurrent writers
+def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retries: int = 3):
+    # optimistic append with small retry (handles concurrent writers)
     for attempt in range(retries):
         try:
             prev = read_text_from_drive(drive, file_id)
             updated = prev + "".join(new_lines)
-            media = MediaIoBaseUpload(io.BytesIO(updated.encode("utf-8")), mimetype="text/plain", resumable=False)
-            drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+            media = MediaIoBaseUpload(io.BytesIO(updated.encode("utf-8")),
+                                      mimetype="text/plain", resumable=False)
+            drive.files().update(fileId=file_id, media_body=media,
+                                 supportsAllDrives=True).execute()
             return
         except HttpError:
             time.sleep(0.4 * (attempt + 1))
     # last attempt without merge (still better than losing data)
-    media = MediaIoBaseUpload(io.BytesIO("".join(new_lines).encode("utf-8")), mimetype="text/plain", resumable=False)
-    drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+    media = MediaIoBaseUpload(io.BytesIO("".join(new_lines).encode("utf-8")),
+                              mimetype="text/plain", resumable=False)
+    drive.files().update(fileId=file_id, media_body=media,
+                         supportsAllDrives=True).execute()
 
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
     if not filename:
         return None
     q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
     resp = drive.files().list(
-        q=q, spaces="drive",
-        fields="files(id,name)", pageSize=1,
+        q=q, spaces="drive", fields="files(id,name)", pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives"
     ).execute()
     files = resp.get("files", [])
@@ -103,7 +110,8 @@ def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_
         "parents": [dest_folder_id],
         "shortcutDetails": {"targetId": src_file_id},
     }
-    res = drive.files().create(body=meta, fields="id,name", supportsAllDrives=True).execute()
+    res = drive.files().create(body=meta, fields="id,name",
+                               supportsAllDrives=True).execute()
     return res["id"]
 
 # ================== Thumbnails + Full-res (toggle) ===================
@@ -112,9 +120,7 @@ def drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
     drv = get_drive()
     try:
         meta = drv.files().get(
-            fileId=file_id,
-            fields="thumbnailLink",
-            supportsAllDrives=True
+            fileId=file_id, fields="thumbnailLink", supportsAllDrives=True
         ).execute()
         url = meta.get("thumbnailLink")
         if not url:
@@ -129,9 +135,7 @@ def drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
 @st.cache_data(show_spinner=False, max_entries=256, ttl=3600)
 def preview_bytes(file_id: str, max_side: int = 900) -> bytes:
     tb = drive_thumbnail_bytes(file_id)
-    src = tb
-    if src is None:
-        src = _download_bytes(get_drive(), file_id)
+    src = tb if tb is not None else _download_bytes(get_drive(), file_id)
     with Image.open(io.BytesIO(src)) as im:
         im = im.convert("RGB")
         im.thumbnail((max_side, max_side))
@@ -141,7 +145,6 @@ def preview_bytes(file_id: str, max_side: int = 900) -> bytes:
 
 @st.cache_data(show_spinner=False, max_entries=128, ttl=1800)
 def original_bytes(file_id: str) -> bytes:
-    # full-quality; cached briefly
     return _download_bytes(get_drive(), file_id)
 
 def show_image(file_id: Optional[str], caption: str, high_quality: bool):
@@ -160,7 +163,7 @@ CAT = {
         "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
         "src_hypo": st.secrets["gcp"]["demography_hypo_folder"],
         "src_adv":  st.secrets["gcp"]["demography_adv_folder"],
-        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],   # accepted → shortcut
+        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],
         "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],
         "log_hypo": st.secrets["gcp"]["demography_hypo_filtered_log_id"],
         "log_adv":  st.secrets["gcp"]["demography_adv_filtered_log_id"],
@@ -191,69 +194,98 @@ CAT = {
     },
 }
 
-drive = get_drive()
+# ===================== Readers / progress from LOGS ======================
+def canonical_user(name: str) -> str:
+    return (name or "").strip().lower()
 
-# ===================== Readers / maps / progress ======================
 @st.cache_data(show_spinner=False)
-def load_meta(jsonl_id: str):
+def load_meta(jsonl_id: str) -> List[Dict[str, Any]]:
     # validate & read
     try:
-        drive.files().get(fileId=jsonl_id, fields="id", supportsAllDrives=True).execute()
+        drive.files().get(fileId=jsonl_id, fields="id",
+                          supportsAllDrives=True).execute()
     except HttpError as e:
         st.error(f"Cannot access JSONL file: {e}")
         st.stop()
     raw = read_text_from_drive(drive, jsonl_id)
-    out = []
+    out: List[Dict[str, Any]] = []
     for ln in raw.splitlines():
         ln = ln.strip()
-        if not ln: continue
+        if not ln:
+            continue
         try:
             out.append(json.loads(ln))
         except Exception:
             pass
     return out
 
-def _latest_by_pair_annotator(lines: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    m: Dict[str, Dict[str, Any]] = {}
-    for rec in lines:
-        hypo = rec.get("hypo_id") or ""
-        adv  = rec.get("adversarial_id") or ""
-        pk   = rec.get("pair_key") or f"{hypo}|{adv}"
-        who  = rec.get("annotator") or "unknown"
-        key  = f"{pk}||{who}"
-        rec["pair_key"] = pk
-        rec["annotator"] = who
-        m[key] = rec  # last wins
+def latest_rows(jsonl_text: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ln in jsonl_text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            pass
+    return out
+
+def load_latest_map_for_annotator(log_file_id: str, who: str) -> Dict[str, Dict]:
+    """Return {pair_key: latest_row} only for this annotator (canonical)."""
+    rows = latest_rows(read_text_from_drive(drive, log_file_id))
+    target = canonical_user(who)
+    m: Dict[str, Dict] = {}
+    for r in rows:
+        pk = r.get("pair_key") or f"{r.get('hypo_id','')}|{r.get('adversarial_id','')}"
+        r["pair_key"] = pk
+        ann = canonical_user(r.get("annotator") or r.get("_annotator_canon") or "")
+        if not ann:
+            ann = target  # back-compat for old rows with no annotator
+            r["annotator"] = who
+        if ann == target:
+            m[pk] = r  # last wins
     return m
 
-@st.cache_data(show_spinner=False)
-def load_map(file_id: str):
-    rows = load_meta(file_id)  # reuse reader
-    return _latest_by_pair_annotator(rows)
+def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict], Dict[str, Dict]]:
+    """Return (completed_set, hypo_map, adv_map) for this annotator."""
+    log_h_map = load_latest_map_for_annotator(cat_cfg["log_hypo"], who)
+    log_a_map = load_latest_map_for_annotator(cat_cfg["log_adv"],  who)
+    completed = set()
+    for pk in set(log_h_map.keys()) | set(log_a_map.keys()):
+        s_h = (log_h_map.get(pk, {}).get("status") or "").strip()
+        s_a = (log_a_map.get(pk, {}).get("status") or "").strip()
+        if s_h and s_a:  # any decision (accepted/rejected) counts as completed
+            completed.add(pk)
+    return completed, log_h_map, log_a_map
 
-# --- progress pointer per user & category (saved on Drive) ---
+def pk_of(e: Dict[str, Any]) -> str:
+    return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
+
+def first_undecided_index_for(meta: List[Dict[str, Any]], completed_set: set) -> int:
+    for i, e in enumerate(meta):
+        if pk_of(e) not in completed_set:
+            return i
+    return max(0, len(meta) - 1)
+
+# -------- Optional progress pointer file (kept, but not trusted) ----------
 def progress_file_id_for(cat: str, who: str) -> str:
-    # Create a deterministic name; you must create/locate this once under your logs folder
-    # Add this parent folder to secrets as: progress_parent_id
     parent = st.secrets["gcp"].get("progress_parent_id")
     if not parent:
-        # fallback: put beside hypo log file (works fine)
         parent = st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
-    fname = f"progress_{cat}_{who}.txt"
-
-    # Find or create
+    fname = f"progress_{cat}_{canonical_user(who)}.txt"
     q = f"'{parent}' in parents and name = '{fname}' and trashed = false"
     resp = drive.files().list(q=q, fields="files(id,name)", pageSize=1,
                               supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     files = resp.get("files", [])
     if files:
         return files[0]["id"]
-    # create empty
     media = MediaIoBaseUpload(io.BytesIO(b"0"), mimetype="text/plain", resumable=False)
-    meta  = {"name": fname, "parents":[parent], "mimeType":"text/plain"}
-    return drive.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
+    meta = {"name": fname, "parents":[parent], "mimeType":"text/plain"}
+    return drive.files().create(body=meta, media_body=media, fields="id",
+                                supportsAllDrives=True).execute()["id"]
 
-def load_progress(cat: str, who: str) -> int:
+def load_progress_hint(cat: str, who: str) -> int:
     try:
         fid = progress_file_id_for(cat, who)
         txt = read_text_from_drive(drive, fid).strip()
@@ -261,7 +293,7 @@ def load_progress(cat: str, who: str) -> int:
     except Exception:
         return 0
 
-def save_progress(cat: str, who: str, idx: int):
+def save_progress_hint(cat: str, who: str, idx: int):
     try:
         fid = progress_file_id_for(cat, who)
         media = MediaIoBaseUpload(io.BytesIO(str(idx).encode()), mimetype="text/plain", resumable=False)
@@ -288,8 +320,7 @@ if st.session_state.page == "home":
     cat_pick = st.selectbox("Select category", allowed)
     if st.button("Continue ➜", type="primary", key="home_go"):
         st.session_state.cat = cat_pick
-        # resume true index from Drive (not 0)
-        st.session_state.idx = load_progress(cat_pick, st.session_state.user)
+        # always recompute from logs when entering dashboard
         st.session_state.dec = {}
         st.session_state.saving = False
         go("dashboard")
@@ -305,14 +336,12 @@ elif st.session_state.page == "dashboard":
     who = st.session_state.user
     cfg  = CAT[cat]
     meta = load_meta(cfg["jsonl_id"])
-    log_h = load_map(cfg["log_hypo"])
-    log_a = load_map(cfg["log_adv"])
 
-    def pair_key(e): return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
+    # Build completion strictly from logs for this annotator (robust after crash/redeploy)
+    completed_set, _, _ = build_completion_sets(cfg, who)
+
     total_pairs = len(meta)
-
-    # completed for THIS annotator only
-    completed = sum(1 for e in meta if (f"{pair_key(e)}||{who}" in log_h and f"{pair_key(e)}||{who}" in log_a))
+    completed = sum(1 for e in meta if pk_of(e) in completed_set)
     pending   = total_pairs - completed
 
     st.subheader(f"Category: **{cat}**")
@@ -321,17 +350,9 @@ elif st.session_state.page == "dashboard":
     c2.metric("Completed (you)", completed)
     c3.metric("Pending (you)", pending)
 
-    # default resume index: last stored OR first undecided, whichever is further
-    stored_idx = load_progress(cat, who)
-
-    def first_undecided_index():
-        for i, e in enumerate(meta):
-            pk = pair_key(e)
-            if not (f"{pk}||{who}" in log_h and f"{pk}||{who}" in log_a):
-                return i
-        return len(meta) - 1 if meta else 0
-
-    start_idx = max(stored_idx, first_undecided_index())
+    # Resume from first *undecided by logs*. Use old pointer only as a hint (max with it).
+    hint_idx = load_progress_hint(cat, who)
+    start_idx = max(hint_idx, first_undecided_index_for(meta, completed_set))
 
     if st.button("▶️ Start / Resume", type="primary", key="dash_start"):
         st.session_state.idx = start_idx
@@ -342,7 +363,8 @@ elif st.session_state.page == "dashboard":
 elif st.session_state.page == "review":
     top_l, mid, top_r = st.columns([1,5,2])
     top_l.button("⬅️ Back", on_click=lambda: go("dashboard"), key="rev_back")
-    st.session_state.hq = top_r.toggle("High quality images", value=st.session_state.hq, help="Toggle original bytes (slower) vs cached previews (faster)")
+    st.session_state.hq = top_r.toggle("High quality images", value=st.session_state.hq,
+                                       help="Toggle original bytes (slower) vs cached previews (faster)")
 
     who = st.session_state.user
     cat = st.session_state.cat
@@ -352,17 +374,19 @@ elif st.session_state.page == "review":
         st.warning("No records.")
         st.stop()
 
+    # live progress from logs
+    completed_set, log_h_map, log_a_map = build_completion_sets(cfg, who)
+    st.caption(f"Progress: {len(completed_set)}/{len(meta)} completed for {who}")
+
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
-
-    # identity for this pair
     hypo_name = entry.get("hypo_id", "")
     adv_name  = entry.get("adversarial_id", "")
     pk        = f"{hypo_name}|{adv_name}"
 
-    # saved status for this annotator
-    saved_h = load_map(cfg["log_hypo"]).get(f"{pk}||{who}", {}).get("status")
-    saved_a = load_map(cfg["log_adv"]).get(f"{pk}||{who}", {}).get("status")
+    # saved status for this annotator (from logs)
+    saved_h = (log_h_map.get(pk, {}) or {}).get("status")
+    saved_a = (log_a_map.get(pk, {}) or {}).get("status")
 
     # init temp session decisions from saved
     if pk not in st.session_state.dec:
@@ -408,7 +432,7 @@ elif st.session_state.page == "review":
 
     st.divider()
 
-    # ---------- Save (idempotent) ----------
+    # ---------- Save (idempotent & log-driven resume) ----------
     def save_now():
         st.session_state.saving = True
         dec = st.session_state.dec[pk]
@@ -416,22 +440,23 @@ elif st.session_state.page == "review":
 
         base = dict(entry)
         base["pair_key"]  = pk
-        base["annotator"] = who
+        base["annotator"] = who                     # human-readable
+        base["_annotator_canon"] = canonical_user(who)  # canonical (future-proof)
 
         rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": dec.get("hypo") or "rejected", "decided_at": ts})
         rec_a = dict(base); rec_a.update({"side":"adversarial", "status": dec.get("adv") or "rejected", "decided_at": ts})
 
         # idempotence guard (per session)
-        token = hashlib.sha1(json.dumps({"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":who}).encode()).hexdigest()
+        token = hashlib.sha1(json.dumps({"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":canonical_user(who)}).encode()).hexdigest()
         if st.session_state.last_save_token == token:
             st.info("Already saved this exact decision.")
             st.session_state.saving = False
             return
 
         try:
-            if dec.get("hypo") == "accepted" and src_h_id:
+            if rec_h["status"] == "accepted" and src_h_id:
                 rec_h["copied_id"] = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
-            if dec.get("adv") == "accepted" and src_a_id:
+            if rec_a["status"] == "accepted" and src_a_id:
                 rec_a["copied_id"] = create_shortcut_to_file(drive, src_a_id,  adv_name, cfg["dst_adv"])
         except HttpError as e:
             st.error(f"Drive action failed:\n{e}")
@@ -446,22 +471,28 @@ elif st.session_state.page == "review":
             st.session_state.saving = False
             return
 
-        load_map.clear()
+        # clear caches to reflect the fresh logs
+        load_meta.clear()
+        load_latest_map_for_annotator.clear()
+        build_completion_sets.clear()
+
         st.session_state.last_save_token = token
         st.success("Saved.")
         st.session_state.saving = False
 
-        # persist progress (index & resume)
-        next_idx = min(len(meta)-1, st.session_state.idx + 1)
-        save_progress(cat, who, next_idx)
+        # Jump to first undecided (log-driven). Store a pointer hint (optional).
+        meta_local = load_meta(cfg["jsonl_id"])
+        completed_set_local, _, _ = build_completion_sets(cfg, who)
+        next_idx = first_undecided_index_for(meta_local, completed_set_local)
         st.session_state.idx = next_idx
+        save_progress_hint(cat, who, next_idx)  # harmless hint
         st.rerun()
 
     nav_l, save_c, nav_r = st.columns([1,2,1])
     with nav_l:
         if st.button("⏮ Prev", key=f"prev_{pk}", use_container_width=True):
             st.session_state.idx = max(0, i-1)
-            save_progress(cat, st.session_state.user, st.session_state.idx)
+            save_progress_hint(cat, st.session_state.user, st.session_state.idx)
             st.rerun()
 
     with save_c:
@@ -470,6 +501,7 @@ elif st.session_state.page == "review":
 
     with nav_r:
         if st.button("Next ⏭", key=f"next_{pk}", use_container_width=True):
+            # move forward, but still persist a hint; dashboard will recompute from logs anyway
             st.session_state.idx = min(len(meta)-1, i+1)
-            save_progress(cat, st.session_state.user, st.session_state.idx)
+            save_progress_hint(cat, st.session_state.user, st.session_state.idx)
             st.rerun()
