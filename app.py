@@ -1,5 +1,5 @@
-# app.py — single-page, log-driven, overwrite-safe, compact UI
-import io, json, time, hashlib
+# app.py — single-page, retry-hardened, overwrite-safe, compact UI
+import io, json, time, hashlib, ssl
 from typing import Dict, Any, Optional, List, Tuple
 import requests
 from PIL import Image
@@ -16,7 +16,7 @@ Image.MAX_IMAGE_PIXELS = 80_000_000
 
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
-# ---------- Compact CSS ----------
+# ---------- Compact CSS + red primary button ----------
 st.markdown("""
 <style>
 .block-container {padding-top: 0.7rem; padding-bottom: 0.4rem; max-width: 1400px;}
@@ -25,8 +25,12 @@ h1, h2, h3, h4 {margin: 0.2rem 0;}
 [data-testid="stMetricValue"] {font-size: 1.25rem;}
 .small-text {font-size: 0.9rem; line-height: 1.3rem;}
 .caption {font-size: 0.82rem; color: #aaa;}
-img {max-height: 500px; object-fit: contain;} /* tweak to 460 if needed */
+img {max-height: 500px; object-fit: contain;} /* adjust to 460 if you prefer */
 hr {margin: 0.5rem 0;}
+/* Paint primary buttons red (save) */
+button[k="save_btn"], div[data-testid="stButton"] button:where(.primary) {
+  background-color: #e11d48 !important; border-color: #e11d48 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -73,24 +77,49 @@ def get_drive():
 
 drive = get_drive()
 
-def _download_bytes(drive, file_id: str) -> bytes:
-    req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
-    buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    buf.seek(0)
-    return buf.read()
+def _retry_sleep(attempt: int):
+    time.sleep(min(1.5 * (2 ** attempt), 6.0))
+
+# Keep a tiny in-process cache to survive transient SSL errors
+_inproc_text_cache: Dict[str, str] = {}
+
+def _download_bytes_with_retry(drive, file_id: str, attempts: int = 6) -> bytes:
+    last_err = None
+    for i in range(attempts):
+        try:
+            req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(buf, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            buf.seek(0)
+            return buf.read()
+        except (HttpError, ssl.SSLError, ConnectionError, requests.RequestException) as e:
+            last_err = e
+            _retry_sleep(i)
+    raise last_err  # bubble after exhausting attempts
 
 def read_text_from_drive(drive, file_id: str) -> str:
-    return _download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+    try:
+        data = _download_bytes_with_retry(drive, file_id)
+        text = data.decode("utf-8", errors="ignore")
+        _inproc_text_cache[file_id] = text
+        return text
+    except Exception:
+        # soft-fallback to last known good text if available
+        cached = _inproc_text_cache.get(file_id)
+        if cached is not None:
+            st.info("Drive read hiccup — used cached log contents; UI stays responsive.")
+            return cached
+        raise  # no cache to fall back to
 
 def write_text_to_drive(drive, file_id: str, text: str):
     media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")),
                               mimetype="text/plain", resumable=False)
     drive.files().update(fileId=file_id, media_body=media,
                          supportsAllDrives=True).execute()
+    _inproc_text_cache[file_id] = text  # keep cache in sync
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retries: int = 3):
     for attempt in range(retries):
@@ -99,9 +128,15 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retrie
             updated = prev + "".join(new_lines)
             write_text_to_drive(drive, file_id, updated)
             return
-        except HttpError:
-            time.sleep(0.4 * (attempt + 1))
-    write_text_to_drive(drive, file_id, "".join(new_lines))
+        except Exception:
+            _retry_sleep(attempt)
+    # last attempt: append without read-merge (still better than losing data)
+    try:
+        prev = _inproc_text_cache.get(file_id, "")
+        updated = prev + "".join(new_lines)
+        write_text_to_drive(drive, file_id, updated)
+    except Exception as e:
+        raise e
 
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
     if not filename: return None
@@ -149,7 +184,7 @@ def drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
 @st.cache_data(show_spinner=False, max_entries=256, ttl=3600)
 def preview_bytes(file_id: str, max_side: int = 680) -> bytes:
     tb = drive_thumbnail_bytes(file_id)
-    src = tb if tb is not None else _download_bytes(get_drive(), file_id)
+    src = tb if tb is not None else _download_bytes_with_retry(get_drive(), file_id)
     with Image.open(io.BytesIO(src)) as im:
         im = im.convert("RGB")
         im.thumbnail((max_side, max_side))
@@ -159,7 +194,7 @@ def preview_bytes(file_id: str, max_side: int = 680) -> bytes:
 
 @st.cache_data(show_spinner=False, max_entries=128, ttl=1800)
 def original_bytes(file_id: str) -> bytes:
-    return _download_bytes(get_drive(), file_id)
+    return _download_bytes_with_retry(get_drive(), file_id)
 
 def show_image(file_id: Optional[str], caption: str, high_quality: bool):
     if not file_id:
@@ -396,10 +431,10 @@ with left:
         show_image(src_h_id, hypo_name, high_quality=st.session_state.hq)
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Accept (hypo)", key=f"acc_h_{pk}", use_container_width=True):
+            if st.button("✅ Accept (hypo)", key=f"acc_h_{pk}"):
                 st.session_state.dec[pk]["hypo"] = "accepted"
         with b2:
-            if st.button("❌ Reject (hypo)", key=f"rej_h_{pk}", use_container_width=True):
+            if st.button("❌ Reject (hypo)", key=f"rej_h_{pk}"):
                 st.session_state.dec[pk]["hypo"] = "rejected"
         cur_h = st.session_state.dec[pk]["hypo"]
         st.markdown(
@@ -411,10 +446,10 @@ with left:
         show_image(src_a_id, adv_name, high_quality=st.session_state.hq)
         b3, b4 = st.columns(2)
         with b3:
-            if st.button("✅ Accept (adv)", key=f"acc_a_{pk}", use_container_width=True):
+            if st.button("✅ Accept (adv)", key=f"acc_a_{pk}"):
                 st.session_state.dec[pk]["adv"] = "accepted"
         with b4:
-            if st.button("❌ Reject (adv)", key=f"rej_a_{pk}", use_container_width=True):
+            if st.button("❌ Reject (adv)", key=f"rej_a_{pk}"):
                 st.session_state.dec[pk]["adv"] = "rejected"
         cur_a = st.session_state.dec[pk]["adv"]
         st.markdown(
@@ -496,7 +531,7 @@ with left:
         try:
             append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
             append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
-        except HttpError as e:
+        except Exception as e:
             st.error(f"Failed to append logs: {e}")
             st.session_state.saving = False
             return
@@ -514,8 +549,9 @@ with left:
         next_idx = first_undecided_index_for(meta_local, completed_set_local)
         st.session_state.idx = next_idx
         save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
-        st.rerun()  # <-- correct API
+        st.rerun()
 
+    # NAV row — Prev | Save (red, centered) | Next
     navL, navC, navR = st.columns([1, 2, 1])
     with navL:
         if st.button("⏮ Prev"):
@@ -523,9 +559,8 @@ with left:
             save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
             st.rerun()
     with navC:
-        # Save is enabled only if both sides are chosen
         can_save = (st.session_state.dec[pk]["hypo"] is not None) and (st.session_state.dec[pk]["adv"] is not None)
-        st.button("💾 Save", type="primary", disabled=(st.session_state.saving or not can_save),
+        st.button("💾 Save", type="primary", key="save_btn", disabled=(st.session_state.saving or not can_save),
                   on_click=save_now)
     with navR:
         if st.button("Next ⏭"):
