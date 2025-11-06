@@ -4,12 +4,27 @@ from typing import Dict, Any, Optional, List, Tuple
 import requests
 from PIL import Image
 import streamlit as st
+import collections
 
 # Google Drive API
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+_last_calls = collections.deque(maxlen=10)
+
+def _qps_guard(max_qps=4.0):
+    """Sleep just enough to keep average QPS <= max_qps across recent calls."""
+    import time as _t
+    now = _t.time()
+    _last_calls.append(now)
+    if len(_last_calls) >= 2:
+        span = _last_calls[-1] - _last_calls[0]
+        if span > 0:
+            qps = (len(_last_calls)-1) / span
+            if qps > max_qps:
+                _t.sleep(min(0.25, (qps/max_qps - 1.0) * 0.1))
 
 # ---------- Safe image defaults ----------
 Image.MAX_IMAGE_PIXELS = 80_000_000
@@ -80,6 +95,47 @@ def get_drive():
 
 drive = get_drive()
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
+def list_folder_index(folder_id: str) -> dict[str, str]:
+    """Return name -> fileId mapping for all items in a Drive folder."""
+    drv = get_drive()
+    page_token = None
+    out = {}
+    while True:
+        resp = drv.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name,mimeType,shortcutDetails)",
+            pageSize=1000, pageToken=page_token,
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives"
+        ).execute()
+        for f in resp.get("files", []):
+            out[f["name"]] = f["id"]
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+FLUSH_N = 8        # flush after 8 triplets
+FLUSH_SEC = 20.0   # or every 20s
+
+def _flush_logs_if_needed(cfg, force: bool = False):
+    import time as _t
+    buf = st.session_state.write_buf
+    now = _t.time()
+    need = force or (len(buf["hypo"]) >= FLUSH_N) or (now - buf["last_flush"] >= FLUSH_SEC and (buf["hypo"] or buf["adv"]))
+    if not need:
+        return
+    try:
+        if buf["hypo"]:
+            append_lines_to_drive_text(drive, cfg["log_hypo"], buf["hypo"])
+            buf["hypo"].clear()
+        if buf["adv"]:
+            append_lines_to_drive_text(drive, cfg["log_adv"], buf["adv"])
+            buf["adv"].clear()
+        buf["last_flush"] = now
+    except Exception as e:
+        st.session_state.last_save_flash = {"msg": f"Log flush delayed: {e}", "ok": False, "ts": now}
+
 def _retry_sleep(attempt: int):
     time.sleep(min(1.5 * (2 ** attempt), 6.0))
 
@@ -90,6 +146,7 @@ def _download_bytes_with_retry(drive, file_id: str, attempts: int = 6) -> bytes:
     last_err = None
     for i in range(attempts):
         try:
+            _qps_guard()
             req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
             buf = io.BytesIO()
             dl = MediaIoBaseDownload(buf, req)
@@ -117,6 +174,7 @@ def read_text_from_drive(drive, file_id: str) -> str:
         raise
 
 def write_text_to_drive(drive, file_id: str, text: str):
+    _qps_guard()
     media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")),
                               mimetype="text/plain", resumable=False)
     drive.files().update(fileId=file_id, media_body=media,
@@ -340,6 +398,7 @@ if "hq"   not in st.session_state: st.session_state.hq   = False
 if "saving" not in st.session_state: st.session_state.saving = False
 if "last_save_token" not in st.session_state: st.session_state.last_save_token = None
 if "idx_initialized_for" not in st.session_state: st.session_state.idx_initialized_for = None
+if "write_buf" not in st.session_state: st.session_state.write_buf = {"hypo": [], "adv": [], "last_flush": 0.0}
 
 # ========================= MAIN (single page) =========================
 st.caption(f"Signed in as **{st.session_state.user}**")
@@ -521,8 +580,11 @@ div[data-testid="stButton"] button[k="save_btn"] { width: 100%; }
             return
 
         try:
-            append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
-            append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
+            # append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
+            # append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
+            st.session_state.write_buf["hypo"].append(json.dumps(rec_h, ensure_ascii=False) + "\n")
+            st.session_state.write_buf["adv"].append(json.dumps(rec_a, ensure_ascii=False) + "\n")
+            _flush_logs_if_needed(cfg, force=False)
         except Exception as e:
             st.session_state.saving = False
             st.session_state.last_save_flash = {"msg": f"Failed to append logs: {e}", "ok": False, "ts": time.time()}
@@ -548,26 +610,55 @@ div[data-testid="stButton"] button[k="save_btn"] { width: 100%; }
         st.session_state.last_save_flash = {"msg": "Saved.", "ok": True, "ts": time.time()}
 
     # ========== NAV row — Prev | BIG RED Save | Next ==========
-    navL, navC, navR = st.columns([1, 4, 1])
-    with navL:
-        if st.button("⏮ Prev"):
-            st.session_state.idx = max(0, i-1)
-            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            st.rerun()
+        # --- NAV row ---
+        navL, navC, navR = st.columns([1, 4, 1])
+        
+        with navL:
+            if st.button("⏮ Prev"):
+                st.session_state.idx = max(0, i-1)
+                save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+                _flush_logs_if_needed(cfg, force=False)
+                st.rerun()
+        
+        cur = st.session_state.dec.get(pk, {})
+        can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
+        
+        with navC:
+            st.button("💾 Save", key="save_btn", type="primary",
+                      disabled=(st.session_state.saving or not can_save),
+                      on_click=save_now, use_container_width=True)
+        
+        with navR:
+            if st.button("Next ⏭"):
+                st.session_state.idx = min(len(meta)-1, i+1)
+                save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+                _flush_logs_if_needed(cfg, force=False)
+                st.rerun()
+        
+        # --- Flash message directly UNDER the row ---
+        flash = st.session_state.get("last_save_flash")
+        if flash:
+            (st.success if flash.get("ok") else st.error)(flash["msg"])
+    # navL, navC, navR = st.columns([1, 4, 1])
+    # with navL:
+    #     if st.button("⏮ Prev"):
+    #         st.session_state.idx = max(0, i-1)
+    #         save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+    #         st.rerun()
 
-    cur = st.session_state.dec.get(pk, {})
-    can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
+    # cur = st.session_state.dec.get(pk, {})
+    # can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
 
-    with navC:
-        st.button("💾 Save", key="save_btn", type="primary",
-                  disabled=(st.session_state.saving or not can_save),
-                  on_click=save_now, use_container_width=True)
+    # with navC:
+    #     st.button("💾 Save", key="save_btn", type="primary",
+    #               disabled=(st.session_state.saving or not can_save),
+    #               on_click=save_now, use_container_width=True)
 
-    with navR:
-        if st.button("Next ⏭"):
-            st.session_state.idx = min(len(meta)-1, i+1)
-            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            st.rerun()
+    # with navR:
+    #     if st.button("Next ⏭"):
+    #         st.session_state.idx = min(len(meta)-1, i+1)
+    #         save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+    #         st.rerun()
 
     # ---- Flash area directly UNDER Prev | Save | Next ----
     flash = st.session_state.get("last_save_flash")
