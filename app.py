@@ -1,4 +1,4 @@
-# app.py — single-page, log-driven, overwrite-safe, compact UI (fixed save + pending)
+# app.py — single-page, log-driven, overwrite-safe, compact UI
 import io, json, time, hashlib
 from typing import Dict, Any, Optional, List, Tuple
 import requests
@@ -366,8 +366,12 @@ with left:
     saved_h_copied_id = saved_h_row.get("copied_id")
     saved_a_copied_id = saved_a_row.get("copied_id")
 
+    # Current is blank (None) unless you choose; if there is a saved value, we prefill Current with that
     if pk not in st.session_state.dec:
-        st.session_state.dec[pk] = {"hypo": saved_h or "rejected", "adv": saved_a or "rejected"}
+        st.session_state.dec[pk] = {
+            "hypo": saved_h,   # None if never saved
+            "adv":  saved_a
+        }
 
     st.markdown(f"### {entry.get('id','(no id)')} — <code>{pk}</code>", unsafe_allow_html=True)
 
@@ -397,8 +401,9 @@ with left:
         with b2:
             if st.button("❌ Reject (hypo)", key=f"rej_h_{pk}", use_container_width=True):
                 st.session_state.dec[pk]["hypo"] = "rejected"
+        cur_h = st.session_state.dec[pk]["hypo"]
         st.markdown(
-            f'<div class="caption">Current: <b>{st.session_state.dec[pk]["hypo"]}</b> | '
+            f'<div class="caption">Current: <b>{cur_h if cur_h else "—"}</b> | '
             f'Saved: <b>{saved_h or "—"}</b></div>', unsafe_allow_html=True)
 
     with imgR:
@@ -411,8 +416,9 @@ with left:
         with b4:
             if st.button("❌ Reject (adv)", key=f"rej_a_{pk}", use_container_width=True):
                 st.session_state.dec[pk]["adv"] = "rejected"
+        cur_a = st.session_state.dec[pk]["adv"]
         st.markdown(
-            f'<div class="caption">Current: <b>{st.session_state.dec[pk]["adv"]}</b> | '
+            f'<div class="caption">Current: <b>{cur_a if cur_a else "—"}</b> | '
             f'Saved: <b>{saved_a or "—"}</b></div>', unsafe_allow_html=True)
 
     st.markdown("<hr/>", unsafe_allow_html=True)
@@ -420,7 +426,16 @@ with left:
     # ---------- SAVE & NAV (overwrite-safe + cleanup) ----------
     def save_now():
         st.session_state.saving = True
+
         dec = st.session_state.dec[pk]
+        cur_h, cur_a = dec.get("hypo"), dec.get("adv")
+
+        # Require explicit decisions on BOTH sides before writing
+        if cur_h is None or cur_a is None:
+            st.warning("Decide both sides (hypothesis & adversarial) before saving.")
+            st.session_state.saving = False
+            return
+
         ts  = int(time.time())
 
         base = dict(entry)
@@ -428,10 +443,10 @@ with left:
         base["annotator"] = st.session_state.user
         base["_annotator_canon"] = canonical_user(st.session_state.user)
 
-        new_h_status = (dec.get("hypo") or "rejected").strip()
-        new_a_status = (dec.get("adv")  or "rejected").strip()
+        new_h_status = cur_h
+        new_a_status = cur_a
 
-        # Use local working copies to avoid Python scoping errors
+        # Use local working copies to avoid scoping issues
         prev_h_copied = saved_h_copied_id
         prev_a_copied = saved_a_copied_id
         new_h_copied  = prev_h_copied
@@ -443,7 +458,6 @@ with left:
                 delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
                 new_h_copied = None
             if new_h_status == "accepted":
-                # replace any existing shortcut with a fresh one
                 delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
                 if src_h_id:
                     new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
@@ -500,19 +514,21 @@ with left:
         next_idx = first_undecided_index_for(meta_local, completed_set_local)
         st.session_state.idx = next_idx
         save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
-        st.experimental_rerun()
+        st.rerun()  # <-- correct API
 
     navL, navC, navR = st.columns([1, 2, 1])
     with navL:
-        if st.button("⏮ Prev", use_container_width=True):
+        if st.button("⏮ Prev"):
             st.session_state.idx = max(0, i-1)
             save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            st.experimental_rerun()
+            st.rerun()
     with navC:
-        st.button("💾 Save", type="primary", use_container_width=True,
-                  disabled=st.session_state.saving, on_click=save_now)
+        # Save is enabled only if both sides are chosen
+        can_save = (st.session_state.dec[pk]["hypo"] is not None) and (st.session_state.dec[pk]["adv"] is not None)
+        st.button("💾 Save", type="primary", disabled=(st.session_state.saving or not can_save),
+                  on_click=save_now)
     with navR:
-        if st.button("Next ⏭", use_container_width=True):
+        if st.button("Next ⏭"):
             st.session_state.idx = min(len(meta)-1, i+1)
             save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            st.experimental_rerun()
+            st.rerun()
