@@ -16,7 +16,7 @@ Image.MAX_IMAGE_PIXELS = 80_000_000
 
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
-# ---------- Compact CSS + red primary button ----------
+# ---------- Compact CSS + big red Save in middle ----------
 st.markdown("""
 <style>
 .block-container {padding-top: 0.7rem; padding-bottom: 0.4rem; max-width: 1400px;}
@@ -27,10 +27,13 @@ h1, h2, h3, h4 {margin: 0.2rem 0;}
 .caption {font-size: 0.82rem; color: #aaa;}
 img {max-height: 500px; object-fit: contain;} /* adjust to 460 if you prefer */
 hr {margin: 0.5rem 0;}
-/* Paint primary buttons red (save) */
-button[k="save_btn"], div[data-testid="stButton"] button:where(.primary) {
+/* Force primary buttons to red (used for Save) */
+div[data-testid="stButton"] button[k="save_btn"], 
+div[data-testid="stButton"] button:where(.primary) {
   background-color: #e11d48 !important; border-color: #e11d48 !important;
 }
+/* Make center Save button span full width of its column */
+div[data-testid="stButton"] button[k="save_btn"] { width: 100%; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -80,7 +83,7 @@ drive = get_drive()
 def _retry_sleep(attempt: int):
     time.sleep(min(1.5 * (2 ** attempt), 6.0))
 
-# Keep a tiny in-process cache to survive transient SSL errors
+# small in-process cache so UI doesn’t die during brief SSL hiccups
 _inproc_text_cache: Dict[str, str] = {}
 
 def _download_bytes_with_retry(drive, file_id: str, attempts: int = 6) -> bytes:
@@ -98,7 +101,7 @@ def _download_bytes_with_retry(drive, file_id: str, attempts: int = 6) -> bytes:
         except (HttpError, ssl.SSLError, ConnectionError, requests.RequestException) as e:
             last_err = e
             _retry_sleep(i)
-    raise last_err  # bubble after exhausting attempts
+    raise last_err
 
 def read_text_from_drive(drive, file_id: str) -> str:
     try:
@@ -107,19 +110,18 @@ def read_text_from_drive(drive, file_id: str) -> str:
         _inproc_text_cache[file_id] = text
         return text
     except Exception:
-        # soft-fallback to last known good text if available
         cached = _inproc_text_cache.get(file_id)
         if cached is not None:
             st.info("Drive read hiccup — used cached log contents; UI stays responsive.")
             return cached
-        raise  # no cache to fall back to
+        raise
 
 def write_text_to_drive(drive, file_id: str, text: str):
     media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")),
                               mimetype="text/plain", resumable=False)
     drive.files().update(fileId=file_id, media_body=media,
                          supportsAllDrives=True).execute()
-    _inproc_text_cache[file_id] = text  # keep cache in sync
+    _inproc_text_cache[file_id] = text
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retries: int = 3):
     for attempt in range(retries):
@@ -130,13 +132,10 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retrie
             return
         except Exception:
             _retry_sleep(attempt)
-    # last attempt: append without read-merge (still better than losing data)
-    try:
-        prev = _inproc_text_cache.get(file_id, "")
-        updated = prev + "".join(new_lines)
-        write_text_to_drive(drive, file_id, updated)
-    except Exception as e:
-        raise e
+    # final attempt without merge
+    prev = _inproc_text_cache.get(file_id, "")
+    updated = prev + "".join(new_lines)
+    write_text_to_drive(drive, file_id, updated)
 
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
     if not filename: return None
@@ -268,6 +267,7 @@ def latest_rows(jsonl_text: str) -> List[Dict[str, Any]]:
         except Exception: pass
     return out
 
+@st.cache_data(show_spinner=False)
 def load_latest_map_for_annotator(log_file_id: str, who: str) -> Dict[str, Dict]:
     rows = latest_rows(read_text_from_drive(drive, log_file_id))
     target = canonical_user(who)
@@ -349,8 +349,7 @@ with right:
     allowed = st.session_state.get("allowed", [])
     cat_pick = st.selectbox("Category", allowed,
                             index=allowed.index(st.session_state.cat) if st.session_state.cat in allowed else 0)
-    cat_changed = (cat_pick != st.session_state.cat)
-    if cat_changed:
+    if cat_pick != st.session_state.cat:
         st.session_state.cat = cat_pick
         st.session_state.dec = {}
         st.session_state.idx_initialized_for = None
@@ -401,16 +400,12 @@ with left:
     saved_h_copied_id = saved_h_row.get("copied_id")
     saved_a_copied_id = saved_a_row.get("copied_id")
 
-    # Current is blank (None) unless you choose; if there is a saved value, we prefill Current with that
     if pk not in st.session_state.dec:
-        st.session_state.dec[pk] = {
-            "hypo": saved_h,   # None if never saved
-            "adv":  saved_a
-        }
+        st.session_state.dec[pk] = {"hypo": saved_h, "adv": saved_a}
 
     st.markdown(f"### {entry.get('id','(no id)')} — <code>{pk}</code>", unsafe_allow_html=True)
 
-    # Text: one visible line + two expanders
+    # Text area: brief TEXT visible + HYPOTHESIS/ADVERSARIAL in collapsible expanders
     st.markdown(f'**TEXT**: {entry.get("text","")}')
     cexp1, cexp2 = st.columns(2)
     with cexp1:
@@ -437,9 +432,8 @@ with left:
             if st.button("❌ Reject (hypo)", key=f"rej_h_{pk}"):
                 st.session_state.dec[pk]["hypo"] = "rejected"
         cur_h = st.session_state.dec[pk]["hypo"]
-        st.markdown(
-            f'<div class="caption">Current: <b>{cur_h if cur_h else "—"}</b> | '
-            f'Saved: <b>{saved_h or "—"}</b></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="caption">Current: <b>{cur_h if cur_h else "—"}</b> | '
+                    f'Saved: <b>{saved_h or "—"}</b></div>', unsafe_allow_html=True)
 
     with imgR:
         st.markdown("**Adversarial (proto)**")
@@ -452,9 +446,8 @@ with left:
             if st.button("❌ Reject (adv)", key=f"rej_a_{pk}"):
                 st.session_state.dec[pk]["adv"] = "rejected"
         cur_a = st.session_state.dec[pk]["adv"]
-        st.markdown(
-            f'<div class="caption">Current: <b>{cur_a if cur_a else "—"}</b> | '
-            f'Saved: <b>{saved_a or "—"}</b></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="caption">Current: <b>{cur_a if cur_a else "—"}</b> | '
+                    f'Saved: <b>{saved_a or "—"}</b></div>', unsafe_allow_html=True)
 
     st.markdown("<hr/>", unsafe_allow_html=True)
 
@@ -464,15 +457,12 @@ with left:
 
         dec = st.session_state.dec[pk]
         cur_h, cur_a = dec.get("hypo"), dec.get("adv")
-
-        # Require explicit decisions on BOTH sides before writing
         if cur_h is None or cur_a is None:
             st.warning("Decide both sides (hypothesis & adversarial) before saving.")
             st.session_state.saving = False
             return
 
         ts  = int(time.time())
-
         base = dict(entry)
         base["pair_key"]  = pk
         base["annotator"] = st.session_state.user
@@ -481,14 +471,13 @@ with left:
         new_h_status = cur_h
         new_a_status = cur_a
 
-        # Use local working copies to avoid scoping issues
         prev_h_copied = saved_h_copied_id
         prev_a_copied = saved_a_copied_id
         new_h_copied  = prev_h_copied
         new_a_copied  = prev_a_copied
 
-        # HYPOTHESIS side reconciliation
         try:
+            # HYPOTHESIS
             if saved_h == "accepted" and new_h_status != "accepted":
                 delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
                 new_h_copied = None
@@ -496,13 +485,7 @@ with left:
                 delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
                 if src_h_id:
                     new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
-        except HttpError as e:
-            st.error(f"Hypothesis shortcut update failed:\n{e}")
-            st.session_state.saving = False
-            return
-
-        # ADVERSARIAL side reconciliation
-        try:
+            # ADVERSARIAL
             if saved_a == "accepted" and new_a_status != "accepted":
                 delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
                 new_a_copied = None
@@ -511,7 +494,7 @@ with left:
                 if src_a_id:
                     new_a_copied = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
         except HttpError as e:
-            st.error(f"Adversarial shortcut update failed:\n{e}")
+            st.error(f"Drive shortcut update failed:\n{e}")
             st.session_state.saving = False
             return
 
@@ -536,8 +519,16 @@ with left:
             st.session_state.saving = False
             return
 
-        # Invalidate caches so counts and Saved values refresh immediately
-        load_meta.clear(); load_latest_map_for_annotator.clear(); build_completion_sets.clear()
+        # Invalidate ONLY cached functions (fixes your AttributeError)
+        try:
+            load_meta.clear()
+        except Exception:
+            pass
+        try:
+            load_latest_map_for_annotator.clear()
+        except Exception:
+            pass
+        # NOTE: build_completion_sets is NOT cached — do NOT clear it.
 
         st.session_state.last_save_token = token
         st.success("Saved.")
@@ -551,8 +542,8 @@ with left:
         save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
         st.rerun()
 
-    # NAV row — Prev | Save (red, centered) | Next
-    navL, navC, navR = st.columns([1, 2, 1])
+    # NAV row — Prev | (BIG RED) Save | Next
+    navL, navC, navR = st.columns([1, 3, 1])
     with navL:
         if st.button("⏮ Prev"):
             st.session_state.idx = max(0, i-1)
@@ -560,7 +551,8 @@ with left:
             st.rerun()
     with navC:
         can_save = (st.session_state.dec[pk]["hypo"] is not None) and (st.session_state.dec[pk]["adv"] is not None)
-        st.button("💾 Save", type="primary", key="save_btn", disabled=(st.session_state.saving or not can_save),
+        st.button("💾 Save", key="save_btn", type="primary",
+                  disabled=(st.session_state.saving or not can_save),
                   on_click=save_now)
     with navR:
         if st.button("Next ⏭"):
