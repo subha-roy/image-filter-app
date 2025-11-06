@@ -282,24 +282,6 @@ def load_latest_map_for_annotator(log_file_id: str, who: str) -> Dict[str, Dict]
             m[pk] = r  # last wins
     return m
 
-# ---------- NEW: single-log counter (what you asked for) ----------
-@st.cache_data(show_spinner=False)
-def count_completed_from_single_log(log_file_id: str, who: str) -> int:
-    """Count unique pair_keys written by this annotator in ONE filtered log."""
-    text = read_text_from_drive(drive, log_file_id)
-    rows = latest_rows(text)
-    who_c = canonical_user(who)
-    seen = set()
-    for r in rows:
-        ann = canonical_user(r.get("annotator") or r.get("_annotator_canon") or "")
-        if not ann: ann = who_c
-        if ann != who_c: 
-            continue
-        pk = r.get("pair_key") or f"{r.get('hypo_id','')}|{r.get('adversarial_id','')}"
-        if pk:
-            seen.add(pk)
-    return len(seen)
-
 def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict], Dict[str, Dict]]:
     log_h_map = load_latest_map_for_annotator(cat_cfg["log_hypo"], who)
     log_a_map = load_latest_map_for_annotator(cat_cfg["log_adv"],  who)
@@ -315,13 +297,40 @@ def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict]
 def pk_of(e: Dict[str, Any]) -> str:
     return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
 
-def first_undecided_index_for(meta: List[Dict[str, Any]], completed_set: set) -> int:
-    for i, e in enumerate(meta):
-        if pk_of(e) not in completed_set:
-            return i
-    return max(0, len(meta) - 1)
+# -------- NEW: pure record-count for progress/resume (no dedupe, no set logic) --------
+@st.cache_data(show_spinner=False)
+def count_records_for_annotator(log_file_id: str, who: str) -> int:
+    """
+    Count = number of rows in the given filtered log that belong to `who`.
+    We DO NOT dedupe by pair_key and we DO NOT inspect status.
+    """
+    text = read_text_from_drive(drive, log_file_id)
+    who_c = canonical_user(who)
+    cnt = 0
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        ann = canonical_user(r.get("annotator") or r.get("_annotator_canon") or "")
+        if not ann:
+            ann = who_c
+        if ann == who_c:
+            cnt += 1
+    return cnt
 
-# Optional pointer file (hint only) — kept as-is
+def first_undecided_index_from_counts(meta_len: int, hypo_log_id: str, adv_log_id: str, who: str) -> int:
+    # Completed = min(#hypo rows for user, #adv rows for user)
+    h = count_records_for_annotator(hypo_log_id, who)
+    a = count_records_for_annotator(adv_log_id, who)
+    done = min(h, a)
+    # Resume exactly at "done"
+    return min(done, max(0, meta_len - 1))
+
+# Optional pointer file (hint only)
 def progress_file_id_for(cat: str, who: str) -> str:
     parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
     fname = f"progress_{cat}_{canonical_user(who)}.txt"
@@ -376,8 +385,10 @@ with right:
     cfg  = CAT[st.session_state.cat]
     meta = load_meta(cfg["jsonl_id"])
 
-    # ---------- CHANGED: Completed/Pending from ONE filtered log (hypo) ----------
-    completed = count_completed_from_single_log(cfg["log_hypo"], who)
+    # ---------- CHANGED: Completed/Pending from RECORD COUNTS of both logs ----------
+    done_h = count_records_for_annotator(cfg["log_hypo"], who)
+    done_a = count_records_for_annotator(cfg["log_adv"],  who)
+    completed = min(done_h, done_a)
     total_pairs = len(meta)
     pending = max(0, total_pairs - completed)
 
@@ -388,13 +399,12 @@ with right:
 
     st.session_state.hq = st.toggle("High quality images", value=st.session_state.hq)
 
-# ---------- CHANGED: Auto-jump to next = completed count (sequential, single log) ----------
+# ---------- CHANGED: Auto-jump to next = completed count (from both logs) ----------
 if st.session_state.idx_initialized_for != st.session_state.cat:
     cfg_init  = CAT[st.session_state.cat]
     meta_init = load_meta(cfg_init["jsonl_id"])
-    done = count_completed_from_single_log(cfg_init["log_hypo"], st.session_state.user)
-    # If all done, land on last to avoid index overflow
-    st.session_state.idx = min(done, max(0, len(meta_init) - 1))
+    idx = first_undecided_index_from_counts(len(meta_init), cfg_init["log_hypo"], cfg_init["log_adv"], st.session_state.user)
+    st.session_state.idx = idx
     st.session_state.idx_initialized_for = st.session_state.cat
 
 # ------------------------------ LEFT work area ------------------------------
@@ -539,22 +549,24 @@ with left:
             st.session_state.last_save_flash = {"msg": f"Failed to append logs: {e}", "ok": False, "ts": time.time()}
             return
 
-        # Invalidate only cached functions (no AttributeError)
+        # Invalidate only cached functions relevant to counts & saved labels
         try: load_meta.clear()
         except: pass
         try: load_latest_map_for_annotator.clear()
         except: pass
-        try: count_completed_from_single_log.clear()     # <-- clear single-log counter cache
+        try: count_records_for_annotator.clear()
         except: pass
 
         st.session_state.last_save_token = token
         st.session_state.saving = False
 
-        # ---------- CHANGED: next index = count from ONE log (hypo) ----------
-        comp_now = count_completed_from_single_log(cfg["log_hypo"], st.session_state.user)
-        next_idx = min(comp_now, max(0, len(meta)-1))
-        st.session_state.idx = next_idx
-        save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
+        # ---------- CHANGED: next index = min(#hypo_rows, #adv_rows) ----------
+        done_h2 = count_records_for_annotator(cfg["log_hypo"], st.session_state.user)
+        done_a2 = count_records_for_annotator(cfg["log_adv"],  st.session_state.user)
+        next_idx = min(done_h2, done_a2)
+        meta_local = load_meta(cfg["jsonl_id"])
+        st.session_state.idx = min(next_idx, max(0, len(meta_local)-1))
+        save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
 
         # flash message to show UNDER the nav row, in green
         st.session_state.last_save_flash = {"msg": "Saved.", "ok": True, "ts": time.time()}
@@ -588,8 +600,6 @@ with left:
             st.success(flash["msg"])
         else:
             st.error(flash["msg"])
-
-
 # # app.py — single-page, retry-hardened, overwrite-safe, compact UI
 # import io, json, time, hashlib, ssl
 # from typing import Dict, Any, Optional, List, Tuple
@@ -830,7 +840,7 @@ with left:
 #     },
 # }
 
-# # ===================== Readers / progress from LOGS ======================
+# # ===================== Readers / progress ======================
 # def canonical_user(name: str) -> str:
 #     return (name or "").strip().lower()
 
@@ -874,6 +884,24 @@ with left:
 #             m[pk] = r  # last wins
 #     return m
 
+# # ---------- NEW: single-log counter (what you asked for) ----------
+# @st.cache_data(show_spinner=False)
+# def count_completed_from_single_log(log_file_id: str, who: str) -> int:
+#     """Count unique pair_keys written by this annotator in ONE filtered log."""
+#     text = read_text_from_drive(drive, log_file_id)
+#     rows = latest_rows(text)
+#     who_c = canonical_user(who)
+#     seen = set()
+#     for r in rows:
+#         ann = canonical_user(r.get("annotator") or r.get("_annotator_canon") or "")
+#         if not ann: ann = who_c
+#         if ann != who_c: 
+#             continue
+#         pk = r.get("pair_key") or f"{r.get('hypo_id','')}|{r.get('adversarial_id','')}"
+#         if pk:
+#             seen.add(pk)
+#     return len(seen)
+
 # def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict], Dict[str, Dict]]:
 #     log_h_map = load_latest_map_for_annotator(cat_cfg["log_hypo"], who)
 #     log_a_map = load_latest_map_for_annotator(cat_cfg["log_adv"],  who)
@@ -895,7 +923,7 @@ with left:
 #             return i
 #     return max(0, len(meta) - 1)
 
-# # Optional pointer file (hint only)
+# # Optional pointer file (hint only) — kept as-is
 # def progress_file_id_for(cat: str, who: str) -> str:
 #     parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
 #     fname = f"progress_{cat}_{canonical_user(who)}.txt"
@@ -949,10 +977,10 @@ with left:
 #     who = st.session_state.user
 #     cfg  = CAT[st.session_state.cat]
 #     meta = load_meta(cfg["jsonl_id"])
-#     completed_set, _, _ = build_completion_sets(cfg, who)
 
+#     # ---------- CHANGED: Completed/Pending from ONE filtered log (hypo) ----------
+#     completed = count_completed_from_single_log(cfg["log_hypo"], who)
 #     total_pairs = len(meta)
-#     completed = sum(1 for e in meta if pk_of(e) in completed_set)
 #     pending = max(0, total_pairs - completed)
 
 #     c1, c2, c3 = st.columns(3)
@@ -962,12 +990,13 @@ with left:
 
 #     st.session_state.hq = st.toggle("High quality images", value=st.session_state.hq)
 
-# # Auto-jump to first undecided once per category / first load
+# # ---------- CHANGED: Auto-jump to next = completed count (sequential, single log) ----------
 # if st.session_state.idx_initialized_for != st.session_state.cat:
-#     meta_for_init = load_meta(CAT[st.session_state.cat]["jsonl_id"])
-#     comp_set_init, _, _ = build_completion_sets(CAT[st.session_state.cat], st.session_state.user)
-#     hint_idx = load_progress_hint(st.session_state.cat, st.session_state.user)
-#     st.session_state.idx = max(hint_idx, first_undecided_index_for(meta_for_init, comp_set_init))
+#     cfg_init  = CAT[st.session_state.cat]
+#     meta_init = load_meta(cfg_init["jsonl_id"])
+#     done = count_completed_from_single_log(cfg_init["log_hypo"], st.session_state.user)
+#     # If all done, land on last to avoid index overflow
+#     st.session_state.idx = min(done, max(0, len(meta_init) - 1))
 #     st.session_state.idx_initialized_for = st.session_state.cat
 
 # # ------------------------------ LEFT work area ------------------------------
@@ -977,6 +1006,7 @@ with left:
 #     if not meta:
 #         st.warning("No records."); st.stop()
 
+#     # still load maps for "Saved:" labels
 #     completed_set, log_h_map, log_a_map = build_completion_sets(cfg, st.session_state.user)
 
 #     i = max(0, min(st.session_state.idx, len(meta)-1))
@@ -1043,14 +1073,13 @@ with left:
 
 #     st.markdown("<hr/>", unsafe_allow_html=True)
 
-#         # ---------- SAVE & NAV (overwrite-safe + cleanup, no rerun in callback) ----------
+#     # ---------- SAVE & NAV (overwrite-safe + cleanup) ----------
 #     def save_now():
 #         st.session_state.saving = True
 
 #         dec = st.session_state.dec[pk]
 #         cur_h, cur_a = dec.get("hypo"), dec.get("adv")
 #         if cur_h not in {"accepted", "rejected"} or cur_a not in {"accepted", "rejected"}:
-#             # no banner at top; keep UI calm
 #             st.session_state.saving = False
 #             st.session_state.last_save_flash = {"msg": "Decide both sides before saving.", "ok": False, "ts": time.time()}
 #             return
@@ -1117,14 +1146,15 @@ with left:
 #         except: pass
 #         try: load_latest_map_for_annotator.clear()
 #         except: pass
+#         try: count_completed_from_single_log.clear()     # <-- clear single-log counter cache
+#         except: pass
 
 #         st.session_state.last_save_token = token
 #         st.session_state.saving = False
 
-#         # Decide next index now (no st.rerun() here)
-#         meta_local = load_meta(cfg["jsonl_id"])
-#         completed_set_local, _, _ = build_completion_sets(cfg, st.session_state.user)
-#         next_idx = first_undecided_index_for(meta_local, completed_set_local)
+#         # ---------- CHANGED: next index = count from ONE log (hypo) ----------
+#         comp_now = count_completed_from_single_log(cfg["log_hypo"], st.session_state.user)
+#         next_idx = min(comp_now, max(0, len(meta)-1))
 #         st.session_state.idx = next_idx
 #         save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
 
