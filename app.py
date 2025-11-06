@@ -449,7 +449,15 @@ with left:
         st.markdown(f'<div class="caption">Current: <b>{cur_a if cur_a else "—"}</b> | '
                     f'Saved: <b>{saved_a or "—"}</b></div>', unsafe_allow_html=True)
 
-    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("""
+<style>
+div[data-testid="stButton"] button[k="save_btn"],
+div[data-testid="stButton"] button:where(.primary) {
+  background-color: #e11d48 !important; border-color: #e11d48 !important;
+}
+div[data-testid="stButton"] button[k="save_btn"] { width: 100%; }
+</style>
+""", unsafe_allow_html=True)
 
     # ---------- SAVE & NAV (overwrite-safe + cleanup) ----------
     def save_now():
