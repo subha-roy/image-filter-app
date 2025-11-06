@@ -457,7 +457,7 @@ with left:
 
         dec = st.session_state.dec[pk]
         cur_h, cur_a = dec.get("hypo"), dec.get("adv")
-        if cur_h is None or cur_a is None:
+        if cur_h not in {"accepted", "rejected"} or cur_a not in {"accepted", "rejected"}:
             st.warning("Decide both sides (hypothesis & adversarial) before saving.")
             st.session_state.saving = False
             return
@@ -477,7 +477,7 @@ with left:
         new_a_copied  = prev_a_copied
 
         try:
-            # HYPOTHESIS
+            # HYPOTHESIS shortcuts (flip-safe)
             if saved_h == "accepted" and new_h_status != "accepted":
                 delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
                 new_h_copied = None
@@ -485,7 +485,8 @@ with left:
                 delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
                 if src_h_id:
                     new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
-            # ADVERSARIAL
+
+            # ADVERSARIAL shortcuts (flip-safe)
             if saved_a == "accepted" and new_a_status != "accepted":
                 delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
                 new_a_copied = None
@@ -519,22 +520,17 @@ with left:
             st.session_state.saving = False
             return
 
-        # Invalidate ONLY cached functions (fixes your AttributeError)
-        try:
-            load_meta.clear()
-        except Exception:
-            pass
-        try:
-            load_latest_map_for_annotator.clear()
-        except Exception:
-            pass
-        # NOTE: build_completion_sets is NOT cached — do NOT clear it.
+        # Clear only cached functions (fixes the earlier AttributeError)
+        try: load_meta.clear()
+        except: pass
+        try: load_latest_map_for_annotator.clear()
+        except: pass
 
         st.session_state.last_save_token = token
         st.success("Saved.")
         st.session_state.saving = False
 
-        # Jump to first undecided (log-driven) and store pointer hint
+        # Jump to first-UNDONE; persist hint
         meta_local = load_meta(cfg["jsonl_id"])
         completed_set_local, _, _ = build_completion_sets(cfg, st.session_state.user)
         next_idx = first_undecided_index_for(meta_local, completed_set_local)
@@ -542,20 +538,134 @@ with left:
         save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
         st.rerun()
 
-    # NAV row — Prev | (BIG RED) Save | Next
-    navL, navC, navR = st.columns([1, 3, 1])
+    # ========== NAV row — Prev | BIG RED Save | Next ==========
+    # Make Save a wide "space bar" and centered between Prev/Next
+    navL, navC, navR = st.columns([1, 4, 1])  # wider middle column
     with navL:
         if st.button("⏮ Prev"):
             st.session_state.idx = max(0, i-1)
             save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
             st.rerun()
+
+    # compute can_save robustly (avoid false negatives on rerun)
+    cur = st.session_state.dec.get(pk, {})
+    can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
+
     with navC:
-        can_save = (st.session_state.dec[pk]["hypo"] is not None) and (st.session_state.dec[pk]["adv"] is not None)
+        # Big red button, full width of middle column
         st.button("💾 Save", key="save_btn", type="primary",
                   disabled=(st.session_state.saving or not can_save),
-                  on_click=save_now)
+                  on_click=save_now, use_container_width=True)
+
     with navR:
         if st.button("Next ⏭"):
             st.session_state.idx = min(len(meta)-1, i+1)
             save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
             st.rerun()
+# def save_now():
+    #     st.session_state.saving = True
+
+    #     dec = st.session_state.dec[pk]
+    #     cur_h, cur_a = dec.get("hypo"), dec.get("adv")
+    #     if cur_h is None or cur_a is None:
+    #         st.warning("Decide both sides (hypothesis & adversarial) before saving.")
+    #         st.session_state.saving = False
+    #         return
+
+    #     ts  = int(time.time())
+    #     base = dict(entry)
+    #     base["pair_key"]  = pk
+    #     base["annotator"] = st.session_state.user
+    #     base["_annotator_canon"] = canonical_user(st.session_state.user)
+
+    #     new_h_status = cur_h
+    #     new_a_status = cur_a
+
+    #     prev_h_copied = saved_h_copied_id
+    #     prev_a_copied = saved_a_copied_id
+    #     new_h_copied  = prev_h_copied
+    #     new_a_copied  = prev_a_copied
+
+    #     try:
+    #         # HYPOTHESIS
+    #         if saved_h == "accepted" and new_h_status != "accepted":
+    #             delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
+    #             new_h_copied = None
+    #         if new_h_status == "accepted":
+    #             delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
+    #             if src_h_id:
+    #                 new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
+    #         # ADVERSARIAL
+    #         if saved_a == "accepted" and new_a_status != "accepted":
+    #             delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
+    #             new_a_copied = None
+    #         if new_a_status == "accepted":
+    #             delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
+    #             if src_a_id:
+    #                 new_a_copied = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
+    #     except HttpError as e:
+    #         st.error(f"Drive shortcut update failed:\n{e}")
+    #         st.session_state.saving = False
+    #         return
+
+    #     rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": new_h_status, "decided_at": ts})
+    #     if new_h_copied: rec_h["copied_id"] = new_h_copied
+    #     rec_a = dict(base); rec_a.update({"side":"adversarial", "status": new_a_status, "decided_at": ts})
+    #     if new_a_copied: rec_a["copied_id"] = new_a_copied
+
+    #     token = hashlib.sha1(json.dumps(
+    #         {"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":base["_annotator_canon"]}
+    #     ).encode()).hexdigest()
+    #     if st.session_state.last_save_token == token:
+    #         st.info("Already saved this exact decision.")
+    #         st.session_state.saving = False
+    #         return
+
+    #     try:
+    #         append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
+    #         append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
+    #     except Exception as e:
+    #         st.error(f"Failed to append logs: {e}")
+    #         st.session_state.saving = False
+    #         return
+
+    #     # Invalidate ONLY cached functions (fixes your AttributeError)
+    #     try:
+    #         load_meta.clear()
+    #     except Exception:
+    #         pass
+    #     try:
+    #         load_latest_map_for_annotator.clear()
+    #     except Exception:
+    #         pass
+    #     # NOTE: build_completion_sets is NOT cached — do NOT clear it.
+
+    #     st.session_state.last_save_token = token
+    #     st.success("Saved.")
+    #     st.session_state.saving = False
+
+    #     # Jump to first undecided (log-driven) and store pointer hint
+    #     meta_local = load_meta(cfg["jsonl_id"])
+    #     completed_set_local, _, _ = build_completion_sets(cfg, st.session_state.user)
+    #     next_idx = first_undecided_index_for(meta_local, completed_set_local)
+    #     st.session_state.idx = next_idx
+    #     save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
+    #     st.rerun()
+
+    # # NAV row — Prev | (BIG RED) Save | Next
+    # navL, navC, navR = st.columns([1, 3, 1])
+    # with navL:
+    #     if st.button("⏮ Prev"):
+    #         st.session_state.idx = max(0, i-1)
+    #         save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+    #         st.rerun()
+    # with navC:
+    #     can_save = (st.session_state.dec[pk]["hypo"] is not None) and (st.session_state.dec[pk]["adv"] is not None)
+    #     st.button("💾 Save", key="save_btn", type="primary",
+    #               disabled=(st.session_state.saving or not can_save),
+    #               on_click=save_now)
+    # with navR:
+    #     if st.button("Next ⏭"):
+    #         st.session_state.idx = min(len(meta)-1, i+1)
+    #         save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+    #         st.rerun()
