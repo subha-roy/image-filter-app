@@ -340,9 +340,8 @@ def rows_per_prompt() -> int:
 
 def prompt_to_base_index(prompt_id: str, total_len: int) -> int:
     """
-    Map prompt id (e.g., 'dem_00400' or '400') -> target row index using:
-        base = (n - 1) * rows_per_prompt() + 1   (your requested formula)
-    Then clamp to 0..total_len-1 (Streamlit list index is 0-based).
+    Map prompt id (e.g., 'dem_00033' or '33') to the FIRST row of that prompt.
+    If there are R rows per prompt, prompt n starts at index: (n - 1) * R  (0-based).
     """
     if not prompt_id:
         return 0
@@ -350,10 +349,13 @@ def prompt_to_base_index(prompt_id: str, total_len: int) -> int:
     if not m:
         return 0
     n = int(m.group(1))
-    base_one_based = (n - 1) * rows_per_prompt() + 1
-    # convert to 0-based for Python indexing
-    base_zero_based = max(0, base_one_based - 1)
-    return min(base_zero_based, max(0, total_len - 1))
+    R = rows_per_prompt()  # typically 5
+    idx0 = (n - 1) * R                  # <-- first row of prompt n (0-based)
+    if idx0 < 0:
+        idx0 = 0
+    if total_len > 0:
+        idx0 = min(idx0, total_len - 1) # clamp
+    return idx0
 
 # ========================= UI state =========================
 if "cat"  not in st.session_state: st.session_state.cat  = st.session_state.allowed[0]
