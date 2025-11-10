@@ -1,5 +1,5 @@
-# app.py — single-page, retry-hardened, overwrite-safe, compact UI
-import io, json, time, hashlib, ssl, re
+# app.py — single-page, retry-hardened, overwrite-safe, compact UI (stability hardened)
+import io, json, time, hashlib, ssl, re, random, threading
 from typing import Dict, Any, Optional, List, Tuple
 import requests
 from PIL import Image
@@ -61,6 +61,46 @@ if "user" not in st.session_state:
     do_login_ui()
     st.stop()
 
+# =========================== Stability Helpers ===========================
+def _now() -> float: return time.time()
+
+def _jitter(base: float, j: float = 0.2) -> float:
+    # +/- j*base jitter to avoid sync collisions across users
+    return base * (1.0 + random.uniform(-j, j))
+
+def _init_state_defaults():
+    ss = st.session_state
+    ss.setdefault("_btn_last_click", {})          # per-button last click ts
+    ss.setdefault("_global_cooldown_until", 0.0)  # global click cooloff
+    ss.setdefault("_save_lock", False)            # simple mutex for save
+    ss.setdefault("_io_lock", False)              # guard for drive write
+    ss.setdefault("cat", ss.allowed[0])
+    ss.setdefault("idx", 0)
+    ss.setdefault("dec", {})
+    ss.setdefault("hq", False)
+    ss.setdefault("saving", False)
+    ss.setdefault("last_save_token", None)
+    ss.setdefault("idx_initialized_for", None)
+_init_state_defaults()
+
+def safe_button(label: str, key: str, min_interval: float = 0.9, global_interval: float = 0.6, **kwargs) -> bool:
+    """
+    Debounced button: returns True only if both per-button and global cooldowns passed.
+    Prevents spam-click crashes. Adds small random jitter.
+    """
+    clicked = st.button(label, key=key, **kwargs)
+    if not clicked:
+        return False
+    now = _now()
+    last = st.session_state._btn_last_click.get(key, 0.0)
+    if now < max(last + _jitter(min_interval), st.session_state._global_cooldown_until):
+        # swallow the click silently
+        return False
+    # accept click, set next allowed times
+    st.session_state._btn_last_click[key] = now
+    st.session_state._global_cooldown_until = now + _jitter(global_interval)
+    return True
+
 # =========================== Drive helpers ===========================
 @st.cache_resource
 def get_drive():
@@ -79,7 +119,8 @@ def get_drive():
 drive = get_drive()
 
 def _retry_sleep(attempt: int):
-    time.sleep(min(1.5 * (2 ** attempt), 6.0))
+    # capped exponential backoff with jitter
+    time.sleep(min(1.5 * (2 ** attempt), 6.0) * (1.0 + random.uniform(-0.15, 0.15)))
 
 _inproc_text_cache: Dict[str, str] = {}
 
@@ -98,7 +139,11 @@ def _download_bytes_with_retry(drive, file_id: str, attempts: int = 6) -> bytes:
         except (HttpError, ssl.SSLError, ConnectionError, requests.RequestException) as e:
             last_err = e
             _retry_sleep(i)
-    raise last_err
+        except Exception as e:
+            last_err = e
+            _retry_sleep(i)
+    # last fallback: raise to outer error boundary (we will catch there)
+    raise last_err if last_err else RuntimeError("Unknown download error")
 
 def read_text_from_drive(drive, file_id: str) -> str:
     try:
@@ -109,18 +154,38 @@ def read_text_from_drive(drive, file_id: str) -> str:
     except Exception:
         cached = _inproc_text_cache.get(file_id)
         if cached is not None:
-            st.info("Drive read hiccup — used cached log contents; UI stays responsive.")
+            st.info("Drive read hiccup — used cached contents.")
             return cached
+        # propagate but with a user-visible soft error
         raise
 
-def write_text_to_drive(drive, file_id: str, text: str):
-    media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")),
-                              mimetype="text/plain", resumable=False)
-    drive.files().update(fileId=file_id, media_body=media,
-                         supportsAllDrives=True).execute()
-    _inproc_text_cache[file_id] = text
+def write_text_to_drive(drive, file_id: str, text: str, attempts: int = 4):
+    # serialize writes via a simple session mutex to avoid re-entrant corruption
+    if st.session_state._io_lock:
+        # if another write is ongoing, wait briefly and try
+        time.sleep(0.25)
+    st.session_state._io_lock = True
+    try:
+        last_err = None
+        for i in range(attempts):
+            try:
+                media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")),
+                                          mimetype="text/plain", resumable=False)
+                drive.files().update(fileId=file_id, media_body=media,
+                                     supportsAllDrives=True).execute()
+                _inproc_text_cache[file_id] = text
+                return
+            except (HttpError, ssl.SSLError, ConnectionError, requests.RequestException) as e:
+                last_err = e; _retry_sleep(i)
+            except Exception as e:
+                last_err = e; _retry_sleep(i)
+        if last_err:
+            raise last_err
+    finally:
+        st.session_state._io_lock = False
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retries: int = 3):
+    # optimistic read/append with retries and cache fallback
     for attempt in range(retries):
         try:
             prev = read_text_from_drive(drive, file_id)
@@ -129,19 +194,23 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retrie
             return
         except Exception:
             _retry_sleep(attempt)
+    # final fallback: append to cached copy and push
     prev = _inproc_text_cache.get(file_id, "")
     updated = prev + "".join(new_lines)
     write_text_to_drive(drive, file_id, updated)
 
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
     if not filename: return None
-    q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
-    resp = drive.files().list(
-        q=q, spaces="drive", fields="files(id,name,mimeType,shortcutDetails)", pageSize=10,
-        supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives"
-    ).execute()
-    files = resp.get("files", [])
-    return files[0]["id"] if files else None
+    try:
+        q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
+        resp = drive.files().list(
+            q=q, spaces="drive", fields="files(id,name,mimeType,shortcutDetails)", pageSize=10,
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives"
+        ).execute()
+        files = resp.get("files", [])
+        return files[0]["id"] if files else None
+    except Exception:
+        return None
 
 def delete_file_by_id(drive, file_id: Optional[str]):
     if not file_id: return
@@ -149,35 +218,38 @@ def delete_file_by_id(drive, file_id: Optional[str]):
         drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except HttpError:
         pass
+    except Exception:
+        pass
 
-def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
-    meta = {
-        "name": new_name,
-        "mimeType": "application/vnd.google-apps.shortcut",
-        "parents": [dest_folder_id],
-        "shortcutDetails": {"targetId": src_file_id},
-    }
-    res = drive.files().create(body=meta, fields="id,name",
-                               supportsAllDrives=True).execute()
-    return res["id"]
+def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> Optional[str]:
+    try:
+        meta = {
+            "name": new_name,
+            "mimeType": "application/vnd.google-apps.shortcut",
+            "parents": [dest_folder_id],
+            "shortcutDetails": {"targetId": src_file_id},
+        }
+        res = drive.files().create(body=meta, fields="id,name",
+                                   supportsAllDrives=True).execute()
+        return res.get("id")
+    except Exception:
+        return None
 
-# ---- Click throttle ----
+# ---- Legacy cooldown helpers (kept for compatibility with previous keys) ----
 def _cooldown_key(action_key: str) -> str:
     return f"_next_ok_{action_key}"
 
 def cooldown_disabled(action_key: str) -> bool:
-    import time
-    return time.time() < st.session_state.get(_cooldown_key(action_key), 0.0)
+    return _now() < st.session_state.get(_cooldown_key(action_key), 0.0)
 
 def cooldown_start(action_key: str, seconds: float = 0.8):
-    import time
-    st.session_state[_cooldown_key(action_key)] = time.time() + seconds
+    st.session_state[_cooldown_key(action_key)] = _now() + _jitter(seconds, 0.15)
 
 # ================== Thumbnails / Full-res ===================
 @st.cache_data(show_spinner=False, max_entries=512, ttl=3600)
 def drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
-    drv = get_drive()
     try:
+        drv = get_drive()
         meta = drv.files().get(fileId=file_id, fields="thumbnailLink",
                                supportsAllDrives=True).execute()
         url = meta.get("thumbnailLink")
@@ -205,12 +277,12 @@ def original_bytes(file_id: str) -> bytes:
 
 def show_image(file_id: Optional[str], caption: str, high_quality: bool):
     if not file_id:
-        st.error(f"Missing image: {caption}"); return
+        st.warning(f"Missing image: {caption}"); return
     try:
         data = original_bytes(file_id) if high_quality else preview_bytes(file_id)
         st.image(data, caption=caption, use_container_width=True)
     except Exception as e:
-        st.error(f"Failed to render {caption}: {e}")
+        st.warning(f"Failed to render {caption}: {e}")
 
 # =========================== Category config ===========================
 CAT = {
@@ -241,7 +313,7 @@ CAT = {
         "dst_hypo": st.secrets["gcp"]["objects_hypo_filtered"],
         "dst_adv":  st.secrets["gcp"]["objects_adv_filtered"],
         "log_hypo": st.secrets["gcp"]["objects_hypo_filtered_log_id"],
-        "log_adv":  st.secrets["gcp"]["objects_hypo_filtered_log_id"],  # <- ensure correct secret
+        "log_adv":  st.secrets["gcp"]["objects_adv_filtered_log_id"],  # <- FIXED: correct secret
         "hypo_prefix": "obj_h", "adv_prefix":  "obj_ah",
     },
 }
@@ -277,7 +349,10 @@ def latest_rows(jsonl_text: str) -> List[Dict[str, Any]]:
 
 @st.cache_data(show_spinner=False)
 def load_latest_map_for_annotator(log_file_id: str, who: str) -> Dict[str, Dict]:
-    rows = latest_rows(read_text_from_drive(drive, log_file_id))
+    try:
+        rows = latest_rows(read_text_from_drive(drive, log_file_id))
+    except Exception:
+        rows = []
     target = canonical_user(who)
     m: Dict[str, Dict] = {}
     for r in rows:
@@ -307,7 +382,10 @@ def pk_of(e: Dict[str, Any]) -> str:
 
 @st.cache_data(show_spinner=False)
 def count_records_for_annotator(log_file_id: str, who: str) -> int:
-    text = read_text_from_drive(drive, log_file_id)
+    try:
+        text = read_text_from_drive(drive, log_file_id)
+    except Exception:
+        return 0
     who_c = canonical_user(who)
     cnt = 0
     for ln in text.splitlines():
@@ -329,7 +407,8 @@ def first_undecided_index_from_counts(meta_len: int, hypo_log_id: str, adv_log_i
     h = count_records_for_annotator(hypo_log_id, who)
     a = count_records_for_annotator(adv_log_id, who)
     done = min(h, a)
-    return min(done, max(0, meta_len - 1))
+    # clamp to last index (0-based)
+    return min(max(done, 0), max(0, meta_len - 1))
 
 # ---------- Jump helpers ----------
 def rows_per_prompt() -> int:
@@ -340,8 +419,8 @@ def rows_per_prompt() -> int:
 
 def prompt_to_base_index(prompt_id: str, total_len: int) -> int:
     """
-    Map prompt id (e.g., 'dem_00033' or '33') to the FIRST row of that prompt.
-    If there are R rows per prompt, prompt n starts at index: (n - 1) * R  (0-based).
+    Map prompt id (e.g., 'dem_00178' or '178') -> FIRST row of that prompt.
+    0-based: idx0 = (n-1)*R
     """
     if not prompt_id:
         return 0
@@ -349,23 +428,14 @@ def prompt_to_base_index(prompt_id: str, total_len: int) -> int:
     if not m:
         return 0
     n = int(m.group(1))
-    R = rows_per_prompt()  # typically 5
-    idx0 = (n - 1) * R                  # <-- first row of prompt n (0-based)
-    if idx0 < 0:
-        idx0 = 0
-    if total_len > 0:
-        idx0 = min(idx0, total_len - 1) # clamp
+    R = rows_per_prompt()
+    idx0 = (n - 1) * R
+    if idx0 < 0: idx0 = 0
+    if total_len > 0: idx0 = min(idx0, total_len - 1)
     return idx0
 
 # ========================= UI state =========================
-if "cat"  not in st.session_state: st.session_state.cat  = st.session_state.allowed[0]
-if "idx"  not in st.session_state: st.session_state.idx  = 0
-if "dec"  not in st.session_state: st.session_state.dec  = {}
-if "hq"   not in st.session_state: st.session_state.hq   = False
-if "saving" not in st.session_state: st.session_state.saving = False
-if "last_save_token" not in st.session_state: st.session_state.last_save_token = None
-if "idx_initialized_for" not in st.session_state: st.session_state.idx_initialized_for = None
-if "jump_mode" not in st.session_state: st.session_state.jump_mode = False  # <— NEW
+# (already seeded by _init_state_defaults)
 
 # ========================= MAIN (single page) =========================
 st.caption(f"Signed in as **{st.session_state.user}**")
@@ -379,11 +449,14 @@ with right:
         st.session_state.cat = cat_pick
         st.session_state.dec = {}
         st.session_state.idx_initialized_for = None
-        st.session_state.jump_mode = False  # reset jump mode on category change
 
     who = st.session_state.user
     cfg  = CAT[st.session_state.cat]
-    meta = load_meta(cfg["jsonl_id"])
+    try:
+        meta = load_meta(cfg["jsonl_id"])
+    except Exception as e:
+        st.error(f"Failed to load metadata: {e}")
+        meta = []
 
     done_h = count_records_for_annotator(cfg["log_hypo"], who)
     done_a = count_records_for_annotator(cfg["log_adv"],  who)
@@ -407,13 +480,15 @@ with right:
     )
     jcol2.caption(f"Rows/prompt: {rows_per_prompt()}")
 
-    if st.button("Go", key="jump_go_btn"):
+    if safe_button("Go", key="jump_go_btn", min_interval=0.8, global_interval=0.5):
         if not meta:
             st.warning("No records to jump.")
         else:
             base_idx = prompt_to_base_index(jump_value, len(meta))
+            # mark that we jumped (so Next follows from here)
             st.session_state.idx = base_idx
-            st.session_state.jump_mode = True  # <— turn on jump mode
+            st.session_state._jump_anchor_idx = base_idx  # anchor for next navigation
+            # store progress hint (best-effort)
             try:
                 def progress_file_id_for(cat: str, who: str) -> str:
                     parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
@@ -435,16 +510,24 @@ with right:
 
 # ---------- Auto-jump on first load using counts ----------
 if st.session_state.idx_initialized_for != st.session_state.cat:
-    cfg_init  = CAT[st.session_state.cat]
-    meta_init = load_meta(cfg_init["jsonl_id"])
-    idx = first_undecided_index_from_counts(len(meta_init), cfg_init["log_hypo"], cfg_init["log_adv"], st.session_state.user)
-    st.session_state.idx = idx
-    st.session_state.idx_initialized_for = st.session_state.cat
+    try:
+        cfg_init  = CAT[st.session_state.cat]
+        meta_init = load_meta(cfg_init["jsonl_id"])
+        idx = first_undecided_index_from_counts(len(meta_init), cfg_init["log_hypo"], cfg_init["log_adv"], st.session_state.user)
+        st.session_state.idx = idx
+        st.session_state.idx_initialized_for = st.session_state.cat
+    except Exception:
+        st.session_state.idx_initialized_for = st.session_state.cat
 
 # ------------------------------ LEFT work area ------------------------------
 with left:
     cfg = CAT[st.session_state.cat]
-    meta = load_meta(cfg["jsonl_id"])
+    try:
+        meta = load_meta(cfg["jsonl_id"])
+    except Exception as e:
+        st.error(f"Metadata load failed: {e}")
+        st.stop()
+
     if not meta:
         st.warning("No records."); st.stop()
 
@@ -488,13 +571,11 @@ with left:
         b1, b2 = st.columns(2)
         with b1:
             acc_key = f"acc_h_{pk}"
-            if st.button("✅ Accept (hypo)", key=acc_key, disabled=cooldown_disabled(acc_key)):
-                cooldown_start(acc_key)
+            if safe_button("✅ Accept (hypo)", key=acc_key, min_interval=0.7, global_interval=0.5):
                 st.session_state.dec[pk]["hypo"] = "accepted"
         with b2:
             rej_key = f"rej_h_{pk}"
-            if st.button("❌ Reject (hypo)", key=rej_key, disabled=cooldown_disabled(rej_key)):
-                cooldown_start(rej_key)
+            if safe_button("❌ Reject (hypo)", key=rej_key, min_interval=0.7, global_interval=0.5):
                 st.session_state.dec[pk]["hypo"] = "rejected"
         cur_h = st.session_state.dec[pk]["hypo"]
         st.markdown(f'<div class="caption">Current: <b>{cur_h if cur_h else "—"}</b> | '
@@ -506,13 +587,11 @@ with left:
         b3, b4 = st.columns(2)
         with b3:
             acca_key = f"acc_a_{pk}"
-            if st.button("✅ Accept (adv)", key=acca_key, disabled=cooldown_disabled(acca_key)):
-                cooldown_start(acca_key)
+            if safe_button("✅ Accept (adv)", key=acca_key, min_interval=0.7, global_interval=0.5):
                 st.session_state.dec[pk]["adv"] = "accepted"
         with b4:
             reja_key = f"rej_a_{pk}"
-            if st.button("❌ Reject (adv)", key=reja_key, disabled=cooldown_disabled(reja_key)):
-                cooldown_start(reja_key)
+            if safe_button("❌ Reject (adv)", key=reja_key, min_interval=0.7, global_interval=0.5):
                 st.session_state.dec[pk]["adv"] = "rejected"
         cur_a = st.session_state.dec[pk]["adv"]
         st.markdown(f'<div class="caption">Current: <b>{cur_a if cur_a else "—"}</b> | '
@@ -522,119 +601,125 @@ with left:
 
     # ---------- SAVE & NAV ----------
     def save_now():
+        # single-flight: if a save is ongoing, ignore additional clicks
+        if st.session_state._save_lock or st.session_state.saving:
+            return
+        st.session_state._save_lock = True
         st.session_state.saving = True
-
-        dec = st.session_state.dec[pk]
-        cur_h, cur_a = dec.get("hypo"), dec.get("adv")
-        if cur_h not in {"accepted", "rejected"} or cur_a not in {"accepted", "rejected"}:
-            st.session_state.saving = False
-            st.session_state.last_save_flash = {"msg": "Decide both sides before saving.", "ok": False, "ts": time.time()}
-            return
-
-        ts  = int(time.time())
-        base = dict(entry)
-        base["pair_key"]  = pk
-        base["annotator"] = st.session_state.user
-        base["_annotator_canon"] = canonical_user(st.session_state.user)
-
-        new_h_status, new_a_status = cur_h, cur_a
-
-        prev_h_copied = saved_h_copied_id
-        prev_a_copied = saved_a_copied_id
-        new_h_copied  = prev_h_copied
-        new_a_copied  = prev_a_copied
-
         try:
-            if saved_h == "accepted" and new_h_status != "accepted":
-                delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
-                new_h_copied = None
-            if new_h_status == "accepted":
-                delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
-                if src_h_id:
-                    new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
+            dec = st.session_state.dec.get(pk, {})
+            cur_h, cur_a = dec.get("hypo"), dec.get("adv")
+            if cur_h not in {"accepted", "rejected"} or cur_a not in {"accepted", "rejected"}:
+                st.session_state.last_save_flash = {"msg": "Decide both sides before saving.", "ok": False, "ts": _now()}
+                return
 
-            if saved_a == "accepted" and new_a_status != "accepted":
-                delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
-                new_a_copied = None
-            if new_a_status == "accepted":
-                delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
-                if src_a_id:
-                    new_a_copied = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
-        except HttpError as e:
+            ts  = int(time.time())
+            base = dict(entry)
+            base["pair_key"]  = pk
+            base["annotator"] = st.session_state.user
+            base["_annotator_canon"] = canonical_user(st.session_state.user)
+
+            new_h_status, new_a_status = cur_h, cur_a
+
+            prev_h_copied = saved_h_copied_id
+            prev_a_copied = saved_a_copied_id
+            new_h_copied  = prev_h_copied
+            new_a_copied  = prev_a_copied
+
+            try:
+                # HYPOTHESIS shortcuts (flip-safe)
+                if saved_h == "accepted" and new_h_status != "accepted":
+                    delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
+                    new_h_copied = None
+                if new_h_status == "accepted":
+                    delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
+                    if src_h_id:
+                        new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
+
+                # ADVERSARIAL shortcuts (flip-safe)
+                if saved_a == "accepted" and new_a_status != "accepted":
+                    delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
+                    new_a_copied = None
+                if new_a_status == "accepted":
+                    delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
+                    if src_a_id:
+                        new_a_copied = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
+            except HttpError as e:
+                st.session_state.last_save_flash = {"msg": f"Drive shortcut update failed: {e}", "ok": False, "ts": _now()}
+                return
+            except Exception as e:
+                st.session_state.last_save_flash = {"msg": f"Drive op failed: {e}", "ok": False, "ts": _now()}
+                return
+
+            rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": new_h_status, "decided_at": ts})
+            if new_h_copied: rec_h["copied_id"] = new_h_copied
+            rec_a = dict(base); rec_a.update({"side":"adversarial", "status": new_a_status, "decided_at": ts})
+            if new_a_copied: rec_a["copied_id"] = new_a_copied
+
+            token = hashlib.sha1(json.dumps(
+                {"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":base["_annotator_canon"]}
+            ).encode()).hexdigest()
+            if st.session_state.last_save_token == token:
+                st.session_state.last_save_flash = {"msg": "Already saved this exact decision.", "ok": True, "ts": _now()}
+                return
+
+            try:
+                append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
+                append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
+            except Exception as e:
+                st.session_state.last_save_flash = {"msg": f"Failed to append logs: {e}", "ok": False, "ts": _now()}
+                return
+
+            # Invalidate only cached functions relevant to counts & saved labels
+            try: load_meta.clear()
+            except: pass
+            try: load_latest_map_for_annotator.clear()
+            except: pass
+            try: count_records_for_annotator.clear()
+            except: pass
+
+            st.session_state.last_save_token = token
+
+            # Next index = min(#hypo_rows, #adv_rows) (robust read)
+            try:
+                done_h2 = count_records_for_annotator(cfg["log_hypo"], st.session_state.user)
+                done_a2 = count_records_for_annotator(cfg["log_adv"],  st.session_state.user)
+                next_idx = min(done_h2, done_a2)
+                meta_local = load_meta(cfg["jsonl_id"])
+                st.session_state.idx = min(next_idx, max(0, len(meta_local)-1))
+            except Exception:
+                # fallback to simple +1
+                st.session_state.idx = min(len(meta)-1, i+1)
+
+            # persist pointer (best-effort)
+            try:
+                def progress_file_id_for(cat: str, who: str) -> str:
+                    parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
+                    fname = f"progress_{cat}_{canonical_user(who)}.txt"
+                    q = f"'{parent}' in parents and name = '{fname}' and trashed = false"
+                    resp = drive.files().list(q=q, fields="files(id,name)", pageSize=1,
+                                              supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+                    files = resp.get("files", [])
+                    if files: return files[0]["id"]
+                    media = MediaIoBaseUpload(io.BytesIO(b"0"), mimetype="text/plain", resumable=False)
+                    meta_tmp = {"name": fname, "parents":[parent], "mimeType":"text/plain"}
+                    return drive.files().create(body=meta_tmp, media_body=media, fields="id",
+                                                supportsAllDrives=True).execute()["id"]
+                pfid = progress_file_id_for(st.session_state.cat, st.session_state.user)
+                write_text_to_drive(drive, pfid, str(st.session_state.idx))
+            except Exception:
+                pass
+
+            st.session_state.last_save_flash = {"msg": "Saved.", "ok": True, "ts": _now()}
+
+        finally:
             st.session_state.saving = False
-            st.session_state.last_save_flash = {"msg": f"Drive shortcut update failed: {e}", "ok": False, "ts": time.time()}
-            return
-
-        rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": new_h_status, "decided_at": ts})
-        if new_h_copied: rec_h["copied_id"] = new_h_copied
-        rec_a = dict(base); rec_a.update({"side":"adversarial", "status": new_a_status, "decided_at": ts})
-        if new_a_copied: rec_a["copied_id"] = new_a_copied
-
-        token = hashlib.sha1(json.dumps(
-            {"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":base["_annotator_canon"]}
-        ).encode()).hexdigest()
-        if st.session_state.last_save_token == token:
-            st.session_state.saving = False
-            st.session_state.last_save_flash = {"msg": "Already saved this exact decision.", "ok": True, "ts": time.time()}
-            return
-
-        try:
-            append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
-            append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
-        except Exception as e:
-            st.session_state.saving = False
-            st.session_state.last_save_flash = {"msg": f"Failed to append logs: {e}", "ok": False, "ts": time.time()}
-            return
-
-        try: load_meta.clear()
-        except: pass
-        try: load_latest_map_for_annotator.clear()
-        except: pass
-        try: count_records_for_annotator.clear()
-        except: pass
-
-        st.session_state.last_save_token = token
-        st.session_state.saving = False
-
-        # ---------- Where to go next ----------
-        meta_local = load_meta(cfg["jsonl_id"])
-        if st.session_state.get("jump_mode", False):
-            # stay in the jumped flow: just advance by one row
-            next_idx = min(st.session_state.idx + 1, max(0, len(meta_local) - 1))
-        else:
-            # default resume-from-progress behavior
-            done_h2 = count_records_for_annotator(cfg["log_hypo"], st.session_state.user)
-            done_a2 = count_records_for_annotator(cfg["log_adv"],  st.session_state.user)
-            next_idx = min(done_h2, done_a2)
-
-        st.session_state.idx = next_idx
-
-        # persist updated pointer (optional)
-        try:
-            def progress_file_id_for(cat: str, who: str) -> str:
-                parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
-                fname = f"progress_{cat}_{canonical_user(who)}.txt"
-                q = f"'{parent}' in parents and name = '{fname}' and trashed = false"
-                resp = drive.files().list(q=q, fields="files(id,name)", pageSize=1,
-                                          supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-                files = resp.get("files", [])
-                if files: return files[0]["id"]
-                media = MediaIoBaseUpload(io.BytesIO(b"0"), mimetype="text/plain", resumable=False)
-                meta_tmp = {"name": fname, "parents":[parent], "mimeType":"text/plain"}
-                return drive.files().create(body=meta_tmp, media_body=media, fields="id",
-                                            supportsAllDrives=True).execute()["id"]
-            pfid = progress_file_id_for(st.session_state.cat, st.session_state.user)
-            write_text_to_drive(drive, pfid, str(st.session_state.idx))
-        except Exception:
-            pass
-
-        st.session_state.last_save_flash = {"msg": "Saved.", "ok": True, "ts": time.time()}
+            st.session_state._save_lock = False
 
     navL, navC, navR = st.columns([1, 4, 1])
     with navL:
         prev_key = f"prev_{pk}"
-        if st.button("⏮ Prev", key=prev_key, disabled=cooldown_disabled(prev_key)):
-            cooldown_start(prev_key)
+        if safe_button("⏮ Prev", key=prev_key, min_interval=0.5, global_interval=0.4):
             st.session_state.idx = max(0, i-1)
             try:
                 def progress_file_id_for(cat: str, who: str) -> str:
@@ -657,18 +742,18 @@ with left:
 
     cur = st.session_state.dec.get(pk, {})
     can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
-
     with navC:
         save_key = f"save_{pk}"
-        disabled_save = (st.session_state.saving or not can_save or cooldown_disabled(save_key))
-        if st.button("💾 Save", key="save_btn", type="primary", disabled=disabled_save, use_container_width=True):
-            cooldown_start(save_key)
-            save_now()
+        disabled_save = (st.session_state.saving or not can_save)
+        # still use our debounced button to swallow spam clicks even if enabled visually
+        if safe_button("💾 Save", key="save_btn", min_interval=1.0, global_interval=0.7, type="primary", disabled=disabled_save, use_container_width=True):
+            with st.spinner("Saving..."):
+                save_now()
 
     with navR:
         next_key = f"next_{pk}"
-        if st.button("Next ⏭", key=next_key, disabled=cooldown_disabled(next_key)):
-            cooldown_start(next_key)
+        if safe_button("Next ⏭", key=next_key, min_interval=0.5, global_interval=0.4):
+            # If we previously jumped, continue from where we are, not from old anchor
             st.session_state.idx = min(len(meta)-1, i+1)
             try:
                 def progress_file_id_for(cat: str, who: str) -> str:
@@ -695,6 +780,8 @@ with left:
             st.success(flash["msg"])
         else:
             st.error(flash["msg"])
+          
+
 # # app.py — single-page, retry-hardened, overwrite-safe, compact UI
 # import io, json, time, hashlib, ssl, re
 # from typing import Dict, Any, Optional, List, Tuple
@@ -1028,9 +1115,8 @@ with left:
 #     done = min(h, a)
 #     return min(done, max(0, meta_len - 1))
 
-# # ---------- Jump helpers (NEW) ----------
+# # ---------- Jump helpers ----------
 # def rows_per_prompt() -> int:
-#     # configurable; defaults to 5
 #     try:
 #         return int(st.secrets.get("app", {}).get("rows_per_prompt", 5))
 #     except Exception:
@@ -1038,19 +1124,22 @@ with left:
 
 # def prompt_to_base_index(prompt_id: str, total_len: int) -> int:
 #     """
-#     Map prompt id (e.g., 'dem_00400' or '400') -> target row index using:
-#         base = (n - 1) * rows_per_prompt() + 1
-#     Clamped to dataset bounds.
+#     Map prompt id (e.g., 'dem_00033' or '33') to the FIRST row of that prompt.
+#     If there are R rows per prompt, prompt n starts at index: (n - 1) * R  (0-based).
 #     """
 #     if not prompt_id:
 #         return 0
-#     import re
 #     m = re.search(r"(\d+)$", str(prompt_id).strip())
 #     if not m:
 #         return 0
 #     n = int(m.group(1))
-#     base = (n - 1) * rows_per_prompt() + 1
-#     return min(max(0, base), max(0, total_len - 1))
+#     R = rows_per_prompt()  # typically 5
+#     idx0 = (n - 1) * R                  # <-- first row of prompt n (0-based)
+#     if idx0 < 0:
+#         idx0 = 0
+#     if total_len > 0:
+#         idx0 = min(idx0, total_len - 1) # clamp
+#     return idx0
 
 # # ========================= UI state =========================
 # if "cat"  not in st.session_state: st.session_state.cat  = st.session_state.allowed[0]
@@ -1060,6 +1149,7 @@ with left:
 # if "saving" not in st.session_state: st.session_state.saving = False
 # if "last_save_token" not in st.session_state: st.session_state.last_save_token = None
 # if "idx_initialized_for" not in st.session_state: st.session_state.idx_initialized_for = None
+# if "jump_mode" not in st.session_state: st.session_state.jump_mode = False  # <— NEW
 
 # # ========================= MAIN (single page) =========================
 # st.caption(f"Signed in as **{st.session_state.user}**")
@@ -1073,6 +1163,7 @@ with left:
 #         st.session_state.cat = cat_pick
 #         st.session_state.dec = {}
 #         st.session_state.idx_initialized_for = None
+#         st.session_state.jump_mode = False  # reset jump mode on category change
 
 #     who = st.session_state.user
 #     cfg  = CAT[st.session_state.cat]
@@ -1091,23 +1182,22 @@ with left:
 
 #     st.session_state.hq = st.toggle("High quality images", value=st.session_state.hq)
 
-#     # ===== NEW: Jump to Prompt ID (fast) =====
+#     # ===== Jump to Prompt =====
 #     st.markdown("### Jump to Prompt")
 #     jcol1, jcol2 = st.columns([2, 1])
 #     jump_value = jcol1.text_input(
 #         "Enter prompt id or number (e.g., dem_00178 or 178)",
 #         value="", key="jump_prompt_input", label_visibility="collapsed"
 #     )
-#     # Also show rows-per-prompt for clarity (read-only)
 #     jcol2.caption(f"Rows/prompt: {rows_per_prompt()}")
 
 #     if st.button("Go", key="jump_go_btn"):
 #         if not meta:
-#             st.warning("No records to jump."); 
+#             st.warning("No records to jump.")
 #         else:
 #             base_idx = prompt_to_base_index(jump_value, len(meta))
 #             st.session_state.idx = base_idx
-#             # persist the jump as progress hint (optional, safe)
+#             st.session_state.jump_mode = True  # <— turn on jump mode
 #             try:
 #                 def progress_file_id_for(cat: str, who: str) -> str:
 #                     parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
@@ -1290,12 +1380,20 @@ with left:
 #         st.session_state.last_save_token = token
 #         st.session_state.saving = False
 
-#         done_h2 = count_records_for_annotator(cfg["log_hypo"], st.session_state.user)
-#         done_a2 = count_records_for_annotator(cfg["log_adv"],  st.session_state.user)
-#         next_idx = min(done_h2, done_a2)
+#         # ---------- Where to go next ----------
 #         meta_local = load_meta(cfg["jsonl_id"])
-#         st.session_state.idx = min(next_idx, max(0, len(meta_local)-1))
-#         # also persist updated pointer
+#         if st.session_state.get("jump_mode", False):
+#             # stay in the jumped flow: just advance by one row
+#             next_idx = min(st.session_state.idx + 1, max(0, len(meta_local) - 1))
+#         else:
+#             # default resume-from-progress behavior
+#             done_h2 = count_records_for_annotator(cfg["log_hypo"], st.session_state.user)
+#             done_a2 = count_records_for_annotator(cfg["log_adv"],  st.session_state.user)
+#             next_idx = min(done_h2, done_a2)
+
+#         st.session_state.idx = next_idx
+
+#         # persist updated pointer (optional)
 #         try:
 #             def progress_file_id_for(cat: str, who: str) -> str:
 #                 parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
