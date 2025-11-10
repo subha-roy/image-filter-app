@@ -341,19 +341,19 @@ def rows_per_prompt() -> int:
 
 def prompt_to_base_index(prompt_id: str, total_len: int) -> int:
     """
-    Map prompt id (e.g., 'dem_00178' or '178') -> zero-based row index for the first record of that prompt.
-    Assumes sequential IDs and fixed rows per prompt.
+    Map prompt id (e.g., 'dem_00400' or '400') -> target row index using:
+        base = (n - 1) * rows_per_prompt() + 1
+    Clamped to dataset bounds.
     """
-    if not prompt_id: return 0
-    # Extract the trailing number (supports 'dem_00178' or '00178' or '178')
+    if not prompt_id:
+        return 0
+    import re
     m = re.search(r"(\d+)$", str(prompt_id).strip())
     if not m:
         return 0
     n = int(m.group(1))
-    # dem_00001 -> n=1 -> index 0; dem_00178 -> n=178 -> index (177*R)
-    idx0 = max(0, (n - 1) * rows_per_prompt())
-    # clamp to dataset
-    return min(idx0, max(0, total_len - 1))
+    base = (n - 1) * rows_per_prompt() + 1
+    return min(max(0, base), max(0, total_len - 1))
 
 # ========================= UI state =========================
 if "cat"  not in st.session_state: st.session_state.cat  = st.session_state.allowed[0]
