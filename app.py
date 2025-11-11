@@ -39,7 +39,7 @@ div[data-testid="stButton"] button[k="save_btn"] { width: 100%; }
 USERS = {
     "Subhadeep": {"password": "Ado1234", "categories": ["demography"]},
     "Gagan":     {"password": "Ado1234", "categories": ["animal"]},
-    "Robustness":{"password": "Ado1234", "categories": ["demography", "animal", "objects"]},
+    "R":{"password": "1", "categories": ["demography", "animal", "objects"]},
 }
 
 def do_login_ui():
