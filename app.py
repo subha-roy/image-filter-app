@@ -213,38 +213,46 @@ def show_image(file_id: Optional[str], caption: str, high_quality: bool):
         st.error(f"Failed to render {caption}: {e}")
 
 # =========================== Category config ===========================
+def _safe_secret(key: str, default=None):
+    return st.secrets.get("gcp", {}).get(key, default)
+
 CAT = {
     "demography": {
-        "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
-        "src_hypo": st.secrets["gcp"]["demography_hypo_folder"],
-        "src_adv":  st.secrets["gcp"]["demography_adv_folder"],
-        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],
-        "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],
-        "log_hypo": st.secrets["gcp"]["demography_hypo_filtered_log_id"],
-        "log_adv":  st.secrets["gcp"]["demography_adv_filtered_log_id"],
+        "jsonl_id": _safe_secret("demography_jsonl_id"),
+        "src_hypo": _safe_secret("demography_hypo_folder"),
+        "src_adv":  _safe_secret("demography_adv_folder"),
+        "dst_hypo": _safe_secret("demography_hypo_filtered"),
+        "dst_adv":  _safe_secret("demography_adv_filtered"),
+        "log_hypo": _safe_secret("demography_hypo_filtered_log_id"),
+        "log_adv":  _safe_secret("demography_adv_filtered_log_id"),
         "hypo_prefix": "dem_h", "adv_prefix":  "dem_ah",
     },
     "animal": {
-        "jsonl_id": st.secrets["gcp"]["animal_jsonl_id"],
-        "src_hypo": st.secrets["gcp"]["animal_hypo_folder"],
-        "src_adv":  st.secrets["gcp"]["animal_adv_folder"],
-        "dst_hypo": st.secrets["gcp"]["animal_hypo_filtered"],
-        "dst_adv":  st.secrets["gcp"]["animal_adv_filtered"],
-        "log_hypo": st.secrets["gcp"]["animal_hypo_filtered_log_id"],
-        "log_adv":  st.secrets["gcp"]["animal_adv_filtered_log_id"],
+        "jsonl_id": _safe_secret("animal_jsonl_id"),
+        "src_hypo": _safe_secret("animal_hypo_folder"),
+        "src_adv":  _safe_secret("animal_adv_folder"),
+        "dst_hypo": _safe_secret("animal_hypo_filtered"),
+        "dst_adv":  _safe_secret("animal_adv_filtered"),
+        "log_hypo": _safe_secret("animal_hypo_filtered_log_id"),
+        "log_adv":  _safe_secret("animal_adv_filtered_log_id"),
         "hypo_prefix": "ani_h", "adv_prefix":  "ani_ah",
     },
     "objects": {
-        "jsonl_id": st.secrets["gcp"]["objects_jsonl_id"],
-        "src_hypo": st.secrets["gcp"]["objects_hypo_folder"],
-        "src_adv":  st.secrets["gcp"]["objects_adv_folder"],
-        "dst_hypo": st.secrets["gcp"]["objects_hypo_filtered"],
-        "dst_adv":  st.secrets["gcp"]["objects_adv_filtered"],
-        "log_hypo": st.secrets["gcp"]["objects_hypo_filtered_log_id"],
-        "log_adv":  st.secrets["gcp"]["objects_hypo_filtered_log_id"],  # <- ensure correct secret
+        "jsonl_id": _safe_secret("objects_jsonl_id"),
+        "src_hypo": _safe_secret("objects_hypo_folder"),
+        "src_adv":  _safe_secret("objects_adv_folder"),
+        "dst_hypo": _safe_secret("objects_hypo_filtered"),
+        "dst_adv":  _safe_secret("objects_adv_filtered"),
+        "log_hypo": _safe_secret("objects_hypo_filtered_log_id"),
+        "log_adv":  _safe_secret("objects_adv_filtered_log_id"),  # <-- FIXED
         "hypo_prefix": "obj_h", "adv_prefix":  "obj_ah",
     },
 }
+
+for _cat, _cfg in CAT.items():
+    h, a = _cfg.get("log_hypo"), _cfg.get("log_adv")
+    if h and a and h == a:
+        st.warning(f"[Config] {_cat}: log_hypo and log_adv point to the same file. Please fix your secrets.")
 
 # ===================== Readers / progress ======================
 def canonical_user(name: str) -> str:
